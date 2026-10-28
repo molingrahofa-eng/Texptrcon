@@ -1,4 +1,6 @@
 import os
+import io
+import time
 import telebot
 from telebot import types
 import requests
@@ -6,9 +8,8 @@ import urllib3
 
 urllib3.disable_warnings()
 
-# ===== قراءة التوكن (متغير بيئة أو config.py) =====
-BOT_TOKEN = os.getenv("BOT_TOKEN", "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA").strip()
-
+# ===== قراءة التوكن =====
+BOT_TOKEN = os.getenv("6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA", "").strip()
 if not BOT_TOKEN:
     try:
         from config import BOT_TOKEN as CFG_TOKEN
@@ -17,38 +18,11 @@ if not BOT_TOKEN:
         BOT_TOKEN = ""
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ ضع التوكن في متغير البيئة BOT_TOKEN أو في ملف config.py")
+    raise SystemExit("❌ ضع التوكن في BOT_TOKEN أو config.py")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ===== الستايلات =====
-STYLES = [
-    ("diversity", "التنوع — Diversity"),
-    ("hyper-realistic", "واقعي هواية — Hyper Realistic"),
-    ("impressionist", "ستايل انطباعي — Impressionist"),
-    ("low-poly", "ستايل خفيف التفاصيل — Low Poly"),
-    ("isometric", "منظور أيزومتريك — Isometric"),
-    ("cyberpunk", "سايبربنك — Cyberpunk"),
-    ("baroque", "باروكي — Baroque"),
-    ("abstract-expressionism", "مجرد تعبيري — Abstract Expressionism"),
-    ("photorealistic-cgi", "CGI واقعي — Photorealistic CGI"),
-    ("surrealist", "سيريالي — Surrealist")
-]
-
-# ===== المقاسات =====
-SIZES = [
-    ("SQUARE_HD", "مربع 1:1"),
-    ("PORTRAIT_4_3", "طولي 3:4"),
-    ("PORTRAIT_16_9", "طولي 9:16"),
-    ("LANDSCAPE_4_3", "عرضي 4:3"),
-    ("LANDSCAPE_16_9", "عرضي 16:9")
-]
-
-# ===== الحالة =====
-user_state = {}
-user_data = {}
-
-# ===== التوكن من Google =====
+# ===== توكن Google (نفس الطريقة القديمة) =====
 def get_token():
     headers = {
         'Content-Type': 'application/json',
@@ -70,211 +44,185 @@ def get_token():
     ).json()
     return r["idToken"]
 
-# ===== توليد الصور =====
-def generate_images(prompt, styleId, sizeId):
+# ===== دالة تحسين الصورة =====
+def enhance_image(image_bytes, filename="image.jpg"):
+    """
+    ترسل الصورة لـ Photoroom وتجيب نسخة محسّنة/مكبرة.
+    نجرّب عدة endpoints بالترتيب.
+    """
     token = get_token()
+
     headers = {
-        'Host': 'serverless-api.photoroom.com',
-        'Accept': 'text/event-stream',
         'Authorization': token,
-        'Content-Type': 'application/json; charset=utf-8',
-        'User-Agent': 'okhttp/4.12.0',
         'Pr-App-Version': '2025.47.03 (2180)',
         'Pr-Platform': 'android',
+        'User-Agent': 'okhttp/4.12.0',
+        'Accept': 'application/json',
     }
-    payload = {
-        "userPrompt": prompt,
-        "appId": "expert",
-        "styleId": styleId,
-        "sizeId": sizeId,
-        "numberOfImages": 4
-    }
-    resp = requests.post(
-        "https://serverless-api.photoroom.com/v2/ai-tools/generate-images",
-        headers=headers, json=payload, stream=True, verify=False, timeout=120
-    )
-    bg, nobg = [], []
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        l = line.decode()
-        if '"eventType":"aiImageResult"' in l:
-            s = l.find('"imageUrl":"') + 12
-            e = l.find('"', s)
-            bg.append(l[s:e])
-        if '"eventType":"aiImageWithoutBackgroundResult"' in l:
-            s = l.find('"imageUrl":"') + 12
-            e = l.find('"', s)
-            nobg.append(l[s:e])
-    return bg, nobg
 
-# ===== أزرار المطور =====
-def dev_buttons(kb):
-    kb.add(
-        types.InlineKeyboardButton("👨‍💻 المطور", url="https://t.me/p7s7s"),
-        types.InlineKeyboardButton("📢 قناة المطور", url="https://t.me/ZVBZBZB2")
-    )
-    return kb
+    files = {'imageFile': (filename, image_bytes, 'image/jpeg')}
 
-# ===== إرسال الصور بجودة أصلية =====
-def send_images_hd(uid, urls, styleId, sizeId, prompt):
-    total = len(urls)
+    # نحاول على endpoints مختلفة
+    endpoints = [
+        "https://serverless-api.photoroom.com/v2/ai-tools/upscale",
+        "https://serverless-api.photoroom.com/v1/upscale",
+        "https://serverless-api.photoroom.com/v2/upscale",
+    ]
 
-    # 1) ألبوم سريع للمعاينة
-    media = []
-    for i, url in enumerate(urls[:10], 1):
-        cap = (
-            f"🖼 صورة {i}/{total}\n"
-            f"🎨 الستايل: {styleId}\n"
-            f"📐 القياس: {sizeId}\n"
-            f"📝 {prompt[:80]}"
-        )
-        media.append(types.InputMediaPhoto(url, caption=cap))
-    try:
-        bot.send_media_group(uid, media)
-    except Exception:
-        pass
+    last_error = None
 
-    # 2) نسخة ملفات بدون ضغط
-    bot.send_message(uid, "📥 هاي نسخة كاملة بدون ضغط (جودة أصلية):")
-    for i, url in enumerate(urls, 1):
+    for url in endpoints:
         try:
-            r = requests.get(url, timeout=90, verify=False)
-            r.raise_for_status()
-            bot.send_document(
-                uid,
-                r.content,
-                visible_file_name=f"image_{i}.png",
-                caption=f"🖼 صورة {i}/{total} — جودة كاملة"
+            resp = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data={'scale': '2', 'mode': 'upscale'},
+                verify=False,
+                timeout=180
             )
-        except Exception as e:
-            bot.send_message(uid, f"⚠️ تعذّر إرسال الصورة {i} كملف: {e}")
 
-# ===== لوحة بعد النتيجة =====
-def result_menu(uid):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🔁 إعادة توليد", callback_data="regen"),
-        types.InlineKeyboardButton("🏠 رجوع", callback_data="home")
-    )
-    dev_buttons(kb)
-    bot.send_message(uid, "خلصت الصور ✔️ شتريد تسوي هسه؟", reply_markup=kb)
+            if resp.status_code == 200:
+                # نحاول نستخرج رابط الصورة من الرد
+                try:
+                    data = resp.json()
+                except Exception:
+                    # إذا الرد مو JSON، يمكن يكون صورة مباشرة
+                    if resp.content and len(resp.content) > 1000:
+                        return ("bytes", resp.content)
+                    last_error = f"رد غير متوقع من {url}"
+                    continue
+
+                # دوّر عن رابط الصورة في الرد
+                img_url = _extract_url(data)
+                if img_url:
+                    return ("url", img_url)
+                else:
+                    last_error = f"ما لقى رابط بالرد: {str(data)[:200]}"
+                    continue
+            else:
+                last_error = f"{url} → HTTP {resp.status_code}: {resp.text[:150]}"
+                continue
+
+        except Exception as e:
+            last_error = f"{url} → {e}"
+            continue
+
+    raise Exception(last_error or "كل الـ endpoints فشلت")
+
+def _extract_url(obj):
+    """يبحث عن أي رابط صورة داخل الرد (JSON متداخل)"""
+    if isinstance(obj, str):
+        if obj.startswith("http") and any(x in obj.lower() for x in ['.png', '.jpg', '.jpeg', 'image', 'result']):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        # أولوية لمفاتيح معروفة
+        for key in ['url', 'imageUrl', 'image_url', 'result', 'output', 'upscaledUrl', 'outputUrl']:
+            if key in obj:
+                v = _extract_url(obj[key])
+                if v:
+                    return v
+        for v in obj.values():
+            r = _extract_url(v)
+            if r:
+                return r
+    if isinstance(obj, list):
+        for v in obj:
+            r = _extract_url(v)
+            if r:
+                return r
+    return None
 
 # ===== /start =====
 @bot.message_handler(commands=['start'])
 def start(msg):
     text = (
-        "هلا بيك حبي 🌟\n"
-        "هذا بوت يصنع صور نار🔥 وبجودة قوية.\n\n"
-        "طريقة الشغل:\n"
-        "1- تختار ستايل الصورة\n"
-        "2- تختار القياس\n"
-        "3- تكتب البرومبت مالك\n"
-        "وبعدها البوت يسويلك *٤ صور مرتبة* بجودة عالية 🤩\n\n"
-        "اختار الستايل حتى نبدي:"
+        "هلا بيك حبي 🌟\n\n"
+        "هذا بوت *يوضّح الصور* ويطلعها بجودة أعلى 🔍✨\n\n"
+        "طريقة الاستخدام:\n"
+        "1- دز الصورة (كتحويل لصورة أو كملف)\n"
+        "2- انتظر ثواني…\n"
+        "3- البوت يرجعلك الصورة موضّحة بجودة أعلى 📥\n\n"
+        "📌 ملاحظات:\n"
+        "• خلي الصورة واضحة نسبياً حتى تطلع أحسن نتيجة\n"
+        "• الحد الأقصى للصورة 20MB"
     )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for st_id, st_name in STYLES:
-        kb.add(types.InlineKeyboardButton(st_name, callback_data=f"style:{st_id}"))
-    dev_buttons(kb)
-    bot.send_message(msg.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
-# ===== اختيار الستايل =====
-@bot.callback_query_handler(func=lambda c: c.data.startswith("style:"))
-def choose_size(call):
-    uid = call.from_user.id
-    styleId = call.data.split(":")[1]
-    user_data[uid] = {"styleId": styleId}
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for sz_id, sz_name in SIZES:
-        kb.add(types.InlineKeyboardButton(sz_name, callback_data=f"size:{sz_id}"))
-    dev_buttons(kb)
-
-    bot.edit_message_text(
-        "اختار القياس اللي يعجبك:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-# ===== اختيار القياس =====
-@bot.callback_query_handler(func=lambda c: c.data.startswith("size:"))
-def ask_prompt(call):
-    uid = call.from_user.id
-    sizeId = call.data.split(":")[1]
-    user_data.setdefault(uid, {})["sizeId"] = sizeId
-    user_state[uid] = "await_prompt"
-
-    bot.edit_message_text(
-        "دز البرومبت مال الصورة:",
-        call.message.chat.id,
-        call.message.message_id
-    )
-
-# ===== استقبال البرومبت =====
-@bot.message_handler(func=lambda m: user_state.get(m.from_user.id) == "await_prompt")
-def handle_prompt(msg):
+# ===== استقبال الصور =====
+@bot.message_handler(content_types=['photo'])
+def handle_photo(msg):
     uid = msg.from_user.id
-    prompt = msg.text
-    if not prompt:
-        bot.send_message(uid, "اكتب وصف نصي للصورة 🙂")
+
+    # نجيب أكبر حجم
+    file_id = msg.photo[-1].file_id
+    _process_image(uid, file_id, "image.jpg")
+
+@bot.message_handler(content_types=['document'])
+def handle_document(msg):
+    uid = msg.from_user.id
+    doc = msg.document
+
+    if not doc.mime_type or not doc.mime_type.startswith("image/"):
+        bot.reply_to(msg, "❌ هذا مو ملف صورة. دز صورة بصيغة JPG أو PNG.")
         return
 
-    user_data[uid]["prompt"] = prompt
-    styleId = user_data[uid]["styleId"]
-    sizeId = user_data[uid]["sizeId"]
+    ext = "png" if "png" in doc.mime_type else "jpg"
+    _process_image(uid, doc.file_id, f"image.{ext}")
 
-    bot.send_message(uid, "ثواني حبي… دا نسويلك الصور ⏳🔥")
+def _process_image(uid, file_id, filename):
+    # 1) رسالة انتظار
+    wait_msg = bot.send_message(uid, "⏳ ثواني… دا نوضّح صورتك، انتظر شوي 🔍")
 
+    # 2) تنزيل الصورة من تيليكرام
     try:
-        bg, nobg = generate_images(prompt, styleId, sizeId)
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
     except Exception as e:
-        bot.send_message(uid, f"صار خطأ بالتوليد 😢\n{e}")
-        user_state.pop(uid, None)
+        bot.edit_message_text(f"❌ ما كدرت أنزل الصورة: {e}", uid, wait_msg.message_id)
         return
 
-    if not bg:
-        bot.send_message(uid, "ما رجعت ولا صورة 😢 جرّب برومبت ثاني.")
-        user_state.pop(uid, None)
-        return
-
-    send_images_hd(uid, bg, styleId, sizeId, prompt)
-    result_menu(uid)
-    user_state.pop(uid, None)
-
-# ===== رجوع =====
-@bot.callback_query_handler(func=lambda c: c.data == "home")
-def go_home(call):
+    # 3) تحسين الصورة
     try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    start(call.message)
-
-# ===== إعادة توليد =====
-@bot.callback_query_handler(func=lambda c: c.data == "regen")
-def regenerate(call):
-    uid = call.from_user.id
-    d = user_data.get(uid)
-    if not d or "prompt" not in d:
-        bot.answer_callback_query(call.id, "ابدأ من /start")
-        return
-
-    bot.answer_callback_query(call.id, "دا نعيد التوليد… 🔄")
-
-    try:
-        bg, _ = generate_images(d["prompt"], d["styleId"], d["sizeId"])
+        kind, result = enhance_image(downloaded, filename)
     except Exception as e:
-        bot.send_message(uid, f"صار خطأ: {e}")
+        bot.edit_message_text(
+            f"❌ صار خطأ بالتحسين:\n`{str(e)[:300]}`",
+            uid, wait_msg.message_id, parse_mode="Markdown"
+        )
         return
 
-    if not bg:
-        bot.send_message(uid, "ما رجعت صور 😢 جرّب مرة ثانية.")
-        return
+    # 4) إرسال النتيجة
+    try:
+        if kind == "url":
+            # رابط صورة
+            img_resp = requests.get(result, timeout=90, verify=False)
+            img_resp.raise_for_status()
+            img_bytes = img_resp.content
+        else:
+            img_bytes = result
 
-    send_images_hd(uid, bg, d["styleId"], d["sizeId"], d["prompt"])
-    result_menu(uid)
+        # نرسلها كصورة معاينة
+        bot.send_photo(uid, img_bytes, caption="✅ هاي صورتك الموضّحة ✨")
+
+        # ونرسلها كملف بجودة كاملة
+        bot.send_document(
+            uid,
+            img_bytes,
+            visible_file_name="enhanced.png",
+            caption="📥 نسخة كاملة بدون ضغط"
+        )
+
+        bot.delete_message(uid, wait_msg.message_id)
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ تعذّر إرسال الصورة: {e}", uid, wait_msg.message_id)
+
+# ===== رسائل أخرى =====
+@bot.message_handler(content_types=['text'])
+def fallback(msg):
+    bot.reply_to(msg, "📸 دز لي صورة وأنا أوضّحها لك.")
 
 # ===== تشغيل =====
 print("Bot is running…")
