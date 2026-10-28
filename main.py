@@ -1,781 +1,972 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-TikSpark Telegram Bot — The Absolute Ultimate Edition
-Contains: Proxies, Matplotlib Stats, Auto-Relogin, 16/8 Farming, Limits, Subscriptions, Auto-Update via .py file.
-"""
+# ═══════════════════════════════════════════════════════════════
+#  بوت تنزيل 100 فيديو + حذف فوري
+#  لا يخزن سوى tweet_id في JSON صغير
+# ═══════════════════════════════════════════════════════════════
 
-import os
-import sys
-import json
-import time
-import random
 import asyncio
 import hashlib
-import hmac
+import json
+import os
+import re
+import sys
+import time
 import uuid
-import io
-import signal
-import traceback
-import threading
-import concurrent.futures
-from datetime import datetime, timezone, timedelta
-import requests
+from datetime import date
+from typing import Optional
+from urllib.parse import urlsplit
 
-# محاولة استيراد مكتبات الرسم البياني والتشفير
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+import httpx
+import feedparser
+from loguru import logger as _logger
+from telegram import (
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResultArticle, InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedVideo, InputFile,
+    InputTextMessageContent, Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    InlineQueryHandler, MessageHandler, filters,
+)
 
-# ==========================================
-# 🎨 كود ألوان الكونسول (المطور: kilj)
-# ==========================================
-IS_TERMINAL = sys.stdout.isatty()
-def c(text, color_code):
-    if IS_TERMINAL: return f"{color_code}{text}\033[0m"
+# ═══════════════════════════════════════════════════════════════
+#  الإعدادات
+# ═══════════════════════════════════════════════════════════════
+
+BOT_TOKEN = "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA"
+DEVELOPER_ID = 5952132218
+DEVELOPER_NAME = "Ahmed"
+DEVELOPER_CONTACT = "@YourUsername"
+
+RSSHUB_BASE = "https://your-rsshub.up.railway.app"
+
+USE_LOCAL_API = False
+LOCAL_API_URL = "http://localhost:8081/bot"
+LOCAL_API_FILE_URL = "http://localhost:8081/file/bot"
+
+if USE_LOCAL_API:
+    MAX_FILE_SIZE = 2000 * 1024 * 1024
+else:
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+
+USER_DAILY_LIMIT = 10
+ADMIN_DAILY_LIMIT = 99999
+
+DOWNLOAD_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# 📄 ملف JSON صغير لتتبع tweet_id فقط
+TRACK_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tracked_ids.json")
+
+AUTO_DELETE_SECONDS = 60
+BATCH_SIZE = 100
+UPLOAD_READ_TIMEOUT = 1800
+UPLOAD_WRITE_TIMEOUT = 1800
+DOWNLOAD_TIMEOUT = 900
+
+BOT_USERNAME = ""
+BLANK = "\u2800"
+
+# ═══════════════════════════════════════════════════════════════
+#  السجل
+# ═══════════════════════════════════════════════════════════════
+
+_logger.remove()
+_logger.add(sys.stderr, level="INFO")
+_logger.add("bot.log", rotation="10 MB",
+            retention="3 days", level="DEBUG")
+logger = _logger.bind(service="twitter_bot")
+
+background_tasks: set = set()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  📄 ملف JSON صغير (بدل قاعدة بيانات)
+# ═══════════════════════════════════════════════════════════════
+
+def load_tracked():
+    """يقرأ tweet_ids المحفوظة (ملف صغير جداً)."""
+    if not os.path.exists(TRACK_FILE):
+        return {}
+    try:
+        with open(TRACK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_tracked(data):
+    """يحفظ tweet_ids (ملف < 10 KB)."""
+    try:
+        with open(TRACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("save_tracked: {}", e)
+
+
+def is_processed(tweet_id):
+    data = load_tracked()
+    return tweet_id in data
+
+
+def mark_processed(tweet_id):
+    data = load_tracked()
+    data[tweet_id] = int(time.time())
+    # الاحتفاظ بآخر 5000 فقط لتجنب كبر الملف
+    if len(data) > 5000:
+        sorted_items = sorted(
+            data.items(), key=lambda x: x[1], reverse=True)
+        data = dict(sorted_items[:5000])
+    save_tracked(data)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  أدوات
+# ═══════════════════════════════════════════════════════════════
+
+TWEET_URL_RE = re.compile(
+    r"(?:twitter\.com|x\.com|fxtwitter\.com|"
+    r"vxtwitter\.com)/[^/\s]+/status(?:es)?/(\d+)",
+    re.IGNORECASE)
+URL_RE = re.compile(r"https?://\S+")
+
+
+def extract_tweet_id(url):
+    m = TWEET_URL_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def normalize_kind(t):
+    if t in {"image", "photo"}: return "photo"
+    if t in {"video", "gif"}: return "video"
+    return None
+
+
+def extract_media_items(tweet_media):
+    items = []
+    for it in tweet_media.get("media_extended") or []:
+        if not isinstance(it, dict):
+            continue
+        url = it.get("url")
+        kind = normalize_kind(it.get("type"))
+        if url and kind:
+            items.append({"url": url, "type": kind})
+    return items
+
+
+def build_media_id(url):
+    return hashlib.md5(url.encode()).hexdigest()[:16]
+
+
+def build_caption(post_url):
+    if BOT_USERNAME:
+        bot_link = (f'<a href="https://t.me/{BOT_USERNAME}">'
+                    f"@{BOT_USERNAME}</a>")
+        return (f"🐦 بوت التحميل {bot_link}\n"
+                f'🔗 <a href="{post_url}">المصدر</a>')
+    return (f"🐦 بوت التحميل\n"
+            f'🔗 <a href="{post_url}">المصدر</a>')
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024: return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  جلب التغريدة
+# ═══════════════════════════════════════════════════════════════
+
+async def fetch_tweet_media_fx(tweet_id):
+    headers = {"User-Agent": "Mozilla/5.0",
+               "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"https://api.fxtwitter.com/status/{tweet_id}",
+            headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    tweet = data.get("tweet") or {}
+    media = tweet.get("media") or {}
+    me = []
+    for p in media.get("photos") or []:
+        if p.get("url"):
+            me.append({"type": "photo", "url": p["url"]})
+    for v in media.get("videos") or []:
+        if v.get("url"):
+            me.append({"type": "video", "url": v["url"]})
+    return {
+        "tweetURL": tweet.get("url")
+        or f"https://x.com/i/status/{tweet_id}",
+        "media_extended": me,
+    }
+
+
+async def fetch_tweet_media_vx(tweet_id):
+    headers = {"User-Agent": "Mozilla/5.0",
+               "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"https://api.vxtwitter.com/status/{tweet_id}",
+            headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    me = []
+    for m in data.get("media_extended") or []:
+        t = m.get("type")
+        if t == "image":
+            me.append({"type": "photo", "url": m.get("url")})
+        elif t == "video":
+            me.append({"type": "video", "url": m.get("url")})
+    return {
+        "tweetURL": data.get("tweetURL")
+        or f"https://x.com/i/status/{tweet_id}",
+        "media_extended": me,
+    }
+
+
+async def fetch_tweet_media(tweet_id):
+    for name, fn in [
+        ("fxtwitter", fetch_tweet_media_fx),
+        ("vxtwitter", fetch_tweet_media_vx),
+    ]:
+        try:
+            return await fn(tweet_id)
+        except Exception:
+            continue
+    raise RuntimeError("فشل جلب التغريدة")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  RSSHub - جلب آخر 100 تغريدة
+# ═══════════════════════════════════════════════════════════════
+
+async def fetch_100_tweet_ids(username, limit=100):
+    url = (f"{RSSHUB_BASE}/twitter/user/{username}"
+           f"?limit={limit}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with httpx.AsyncClient(
+            timeout=30, follow_redirects=True) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"RSSHub {r.status_code}")
+        feed = feedparser.parse(r.text)
+
+    ids = []
+    for entry in feed.entries:
+        link = entry.get("link", "")
+        m = TWEET_URL_RE.search(link)
+        if m:
+            ids.append(m.group(1))
+    return ids[:limit]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  التنزيل
+# ═══════════════════════════════════════════════════════════════
+
+class DownloadTooLargeError(Exception):
+    pass
+
+
+class Downloader:
+    def __init__(self, output_dir, max_size):
+        self.output_dir = output_dir
+        self.max_size = max_size
+
+    async def download(self, url, filename):
+        """ينزّل ملفاً مؤقتاً - يجب حذفه بعد الإرسال."""
+        full = os.path.join(self.output_dir, filename)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        headers = {"User-Agent": "Mozilla/5.0",
+                   "Referer": "https://x.com/"}
+        timeout = httpx.Timeout(DOWNLOAD_TIMEOUT, connect=30)
+        async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True,
+                headers=headers) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                if total and total > self.max_size:
+                    raise DownloadTooLargeError(
+                        f"{human_size(total)} > "
+                        f"{human_size(self.max_size)}")
+                downloaded = 0
+                with open(full, "wb") as f:
+                    async for chunk in r.aiter_bytes(256 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > self.max_size:
+                            f.close()
+                            os.remove(full)
+                            raise DownloadTooLargeError("تجاوز")
+                        f.write(chunk)
+        return full
+
+
+downloader = Downloader(DOWNLOAD_DIR, MAX_FILE_SIZE)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  إرسال الوسائط
+# ═══════════════════════════════════════════════════════════════
+
+async def send_video_file(chat_id, context, path,
+                          caption=None, reply_markup=None):
+    f = open(path, "rb")
+    try:
+        return await context.bot.send_video(
+            chat_id=chat_id,
+            video=InputFile(f, filename=os.path.basename(path)),
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            supports_streaming=True,
+            reply_markup=reply_markup,
+            read_timeout=UPLOAD_READ_TIMEOUT,
+            write_timeout=UPLOAD_WRITE_TIMEOUT,
+            connect_timeout=60)
+    finally:
+        f.close()
+
+
+async def send_single_photo(chat_id, context, path,
+                            caption=None, reply_markup=None):
+    f = open(path, "rb")
+    try:
+        return await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(f, filename=os.path.basename(path)),
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            read_timeout=UPLOAD_READ_TIMEOUT,
+            write_timeout=UPLOAD_WRITE_TIMEOUT,
+            connect_timeout=60)
+    finally:
+        f.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ⭐ الميزة الجديدة: تنزيل 100 فيديو + حذف فوري
+# ═══════════════════════════════════════════════════════════════
+
+async def process_batch_100(update, context, username):
+    """
+    يجلب آخر 100 تغريدة، ينزّل الفيديوهات واحداً واحداً،
+    يرسلها، ثم يحذف الملف فوراً.
+    """
+    message = update.effective_message
+    user = update.effective_user
+
+    if user.id != DEVELOPER_ID:
+        await message.reply_text(
+            "⛔ هذه الميزة للمشرف فقط.")
+        return
+
+    status = await message.reply_text(
+        f"🔍 <b>جاري جلب آخر {BATCH_SIZE} تغريدة "
+        f"من @{username}...</b>",
+        parse_mode=ParseMode.HTML)
+
+    try:
+        all_ids = await fetch_100_tweet_ids(
+            username, BATCH_SIZE)
+    except Exception as e:
+        try:
+            await status.edit_text(
+                f"❌ <b>فشل جلب التغريدات</b>\n\n"
+                f"<code>{str(e)[:300]}</code>\n\n"
+                "تأكد من:\n"
+                "• رابط RSSHub في RSSHUB_BASE\n"
+                "• الحساب عام",
+                parse_mode=ParseMode.HTML)
+        except TelegramError: pass
+        return
+
+    if not all_ids:
+        try:
+            await status.edit_text(
+                f"⚠️ لا توجد تغريدات لـ @{username}")
+        except TelegramError: pass
+        return
+
+    total = len(all_ids)
+    logger.info("🎬 @{}: {} tweets to process",
+                username, total)
+
+    # تصفية المعالجة سابقاً
+    new_ids = [tid for tid in all_ids
+               if not is_processed(tid)]
+
+    if not new_ids:
+        try:
+            await status.edit_text(
+                f"✅ <b>كل التغريدات معالجة مسبقاً</b>\n\n"
+                f"📊 العدد: {total}\n"
+                f"💡 أرسل /reset لتجاهل السجل",
+                parse_mode=ParseMode.HTML)
+        except TelegramError: pass
+        return
+
+    await status.edit_text(
+        f"📥 <b>جاري التنزيل...</b>\n\n"
+        f"📊 العدد: <b>{len(new_ids)}/{total}</b>\n"
+        f"🗑️ سيُحذف كل ملف بعد الإرسال\n"
+        f"⏳ <b>0/{len(new_ids)}</b>",
+        parse_mode=ParseMode.HTML)
+
+    downloaded_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    for idx, tweet_id in enumerate(new_ids, 1):
+        # تحديث الحالة كل 3 تغريدات
+        if idx % 3 == 0 or idx == len(new_ids):
+            try:
+                pct = int((idx / len(new_ids)) * 100)
+                bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+                await status.edit_text(
+                    f"📥 <b>جاري التنزيل...</b>\n\n"
+                    f"{bar} {pct}%\n\n"
+                    f"⏳ <b>{idx}/{len(new_ids)}</b>\n"
+                    f"✅ نُزّل: {downloaded_count}\n"
+                    f"⏭️ تخطي: {skipped_count}\n"
+                    f"❌ فشل: {failed_count}",
+                    parse_mode=ParseMode.HTML)
+            except TelegramError: pass
+
+        # جلب بيانات التغريدة
+        try:
+            tweet_media = await fetch_tweet_media(tweet_id)
+        except Exception as e:
+            logger.debug("Fetch {}: {}", tweet_id, e)
+            failed_count += 1
+            continue
+
+        items = extract_media_items(tweet_media)
+        if not items:
+            skipped_count += 1
+            mark_processed(tweet_id)
+            continue
+
+        post_url = tweet_media.get(
+            "tweetURL",
+            f"https://x.com/{username}/status/{tweet_id}")
+        caption = build_caption(post_url)
+
+        # تنزيل + إرسال + حذف فوري
+        tweet_sent = 0
+        for m_idx, item in enumerate(items):
+            ext = os.path.splitext(
+                urlsplit(item["url"]).path)[1]
+            if not ext:
+                ext = ".jpg" if item["type"] == "photo" else ".mp4"
+            request_id = uuid.uuid4().hex[:8]
+            fname = f"batch_{tweet_id}_{m_idx}_{request_id}{ext}"
+
+            temp_path = None
+            try:
+                # ═══ 1) تنزيل مؤقت ═══
+                temp_path = await downloader.download(
+                    item["url"], fname)
+                size = os.path.getsize(temp_path)
+                if size > MAX_FILE_SIZE:
+                    continue
+
+                # ═══ 2) إرسال ═══
+                if item["type"] == "video":
+                    await context.bot.send_chat_action(
+                        chat_id=message.chat_id,
+                        action=ChatAction.UPLOAD_VIDEO)
+                    await send_video_file(
+                        message.chat_id, context,
+                        temp_path, caption=caption)
+                else:
+                    await context.bot.send_chat_action(
+                        chat_id=message.chat_id,
+                        action=ChatAction.UPLOAD_PHOTO)
+                    await send_single_photo(
+                        message.chat_id, context,
+                        temp_path, caption=caption)
+
+                tweet_sent += 1
+                caption = None  # الكابشن للأول فقط
+
+            except DownloadTooLargeError:
+                logger.debug("Too large: {}", tweet_id)
+            except TelegramError as e:
+                logger.warning("Send {}: {}", tweet_id, e)
+            except Exception as e:
+                logger.debug("Download {}: {}", tweet_id, e)
+            finally:
+                # ═══ 3) 🗑️ حذف فوري (دائماً) ═══
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                        logger.debug("Deleted: {}", temp_path)
+                    except OSError as e:
+                        logger.warning("Delete failed: {}", e)
+
+        if tweet_sent > 0:
+            downloaded_count += 1
+            mark_processed(tweet_id)
+
+        # تأخير بسيط لتجنب Rate Limit
+        await asyncio.sleep(0.5)
+
+    # ═══ رسالة النهاية ═══
+    final_text = (
+        f"✅ <b>اكتمل التنزيل</b>\n\n"
+        f"📊 <b>النتائج:</b>\n"
+        f"• ✅ تغريدات نُزّلت: <b>{downloaded_count}</b>\n"
+        f"• ⏭️ تخطي: <b>{skipped_count}</b>\n"
+        f"• ❌ فشل: <b>{failed_count}</b>\n"
+        f"• 📦 الإجمالي: <b>{len(new_ids)}</b>\n\n"
+        f"🗑️ <b>تم حذف جميع الملفات المؤقتة</b>\n"
+        f"💾 لم يبقَ سوى tweet_ids في "
+        f"<code>tracked_ids.json</code>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🏠  القائمة الرئيسية",
+            callback_data="menu:main")]])
+    try:
+        await status.edit_text(
+            final_text, parse_mode=ParseMode.HTML,
+            reply_markup=kb)
+    except TelegramError: pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  الاشتراك الإجباري (مبسط)
+# ═══════════════════════════════════════════════════════════════
+
+async def require_subscription(update, context):
+    """تحقق مبسط - بدون قنوات = مسموح."""
+    return True
+
+
+def check_daily_limit(user_id):
+    if user_id == DEVELOPER_ID:
+        return True, 0, ADMIN_DAILY_LIMIT
+    return True, 0, USER_DAILY_LIMIT
+
+
+# ═══════════════════════════════════════════════════════════════
+#  لوحات المفاتيح
+# ═══════════════════════════════════════════════════════════════
+
+def media_actions_keyboard(media_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📤 مشاركة",
+            switch_inline_query=f"media:{media_id}")]])
+
+
+def main_menu_keyboard(is_admin=False):
+    rows = [
+        [InlineKeyboardButton(
+            "📥  تنزيل تغريدة واحدة",
+            callback_data="menu:download")],
+        [InlineKeyboardButton(
+            "🎬  تنزيل 100 فيديو",
+            callback_data="menu:batch100")],
+        [InlineKeyboardButton(
+            "📊  إحصائياتي",
+            callback_data="menu:stats")],
+        [InlineKeyboardButton(
+            "ℹ️  كيف يعمل البوت؟",
+            callback_data="menu:howto")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def back_button(callback="menu:main",
+                text="🔙  رجوع"):
+    return InlineKeyboardButton(text, callback_data=callback)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  النصوص
+# ═══════════════════════════════════════════════════════════════
+
+def main_menu_text(user):
+    tracked = load_tracked()
+    text = (
+        "╭──────────────────╮\n"
+        "     🐦 <b>TWITTER BOT</b>\n"
+        "╰──────────────────╯\n\n"
+        f"👤 أهلاً <b>{user.first_name or 'صديقي'}</b>!\n\n"
+        f"📊 في السجل: <b>{len(tracked)}</b> تغريدة\n"
+        f"📦 حد الملف: <b>{human_size(MAX_FILE_SIZE)}</b>\n\n"
+        "اختر من القائمة 👇")
     return text
 
-res = '\033[0m'; E1 = '\033[1m'; r = '\033[31m'; g = '\033[32m'; y = '\033[33m'; G = '\033[92m'; Y = '\033[93m'; B = '\033[94m'
 
-# ==========================================
-# ⚙️ الإعدادات الأساسية
-# ==========================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA")
-try:
-    OWNER_ID = int(os.environ.get("OWNER_ID", "5952132218"))
-except:
-    OWNER_ID = 5952132218
+HOWTO_TEXT = (
+    "╭──────────────────╮\n"
+    "     📖 <b>كيف يعمل البوت</b>\n"
+    "╰──────────────────╯\n\n"
+    "<b>📥 تنزيل تغريدة واحدة:</b>\n"
+    "أرسل رابط التغريدة مباشرة\n\n"
+    "<b>🎬 تنزيل 100 فيديو:</b>\n"
+    "أرسل <code>/fetch100 @username</code>\n\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "💡 <b>ملاحظات:</b>\n"
+    "• يتم حذف كل ملف بعد الإرسال فوراً\n"
+    "• يُحفظ tweet_id فقط في JSON\n"
+    "• لا توجد قاعدة بيانات\n"
+    "• لا توجد ملفات دائمة"
+)
 
-DEFAULT_DEVINFO = '{"d":"61393235613366373261636533656632","n":"494e46494e495820496e66696e6978204c697465203330","o":"16","t":"d","v":"2.2.9","s":"0,0"}'
-USER_AGENTS = ["okhttp/4.12.0", "okhttp/4.11.0", "okhttp/4.10.0"]
-keybytes = [0x35, 0x30, 0x1c, 0x2f, 0x2c, 0x2c, 0x28, 0x31, 0x35, 0x30, 0x1c, 0x2f, 0x2c, 0x2c, 0x28, 0x31]
-secretkey = bytes([b ^ 0x43 for b in keybytes])
 
-OPERATION_IDS = {
-    "LoginAccount": "3522613813036d73817b2715e67743f8d23d7a85ad08b7e12aa3b29a24a17c43",
-    "AttestDevice": "bfaf5a72aeb9a337811da6a6d13e0b73680a18ffde0c59a23701e55b98ac2515",
-    "GetOrders": "330a1eb97775a2f520b2e848601c40f8211d171c778c18840b37260ce94fb725",
-    "ActionOrder": "5177239275a5e78347f7d925501b1a774b76a086f67c33b0033c740dd676f62b",
-    "CreateOrder": "ad7a6397c3970b1e7601f69d24989bff330e256ee5e39321a8d1ad3fe3879b48",
-}
-ENDPOINT = "https://api.tikspark.xyz/graphql"
-DEFAULT_CSRF = "1786692648457:b5fb61a1a92b2de8ffa0343c5d45ce9f1e578abb695cca7ab6659cfc29f85fe9"
-BAN_CODES = {403, 407, 429}
-AUTH_FATAL = ("unauthorized", "token expired", "invalid token", "not authenticated", "jwt")
+# ═══════════════════════════════════════════════════════════════
+#  تنزيل تغريدة واحدة
+# ═══════════════════════════════════════════════════════════════
 
-DATA_FILE = "data.json"
-DYNAMIC_PRICES = {"followers": 1.0, "likes": 1.0, "views": 1.0, "comments": 2.0}
+async def process_single_tweet(update, context, url, tweet_id):
+    message = update.effective_message
 
-FREE_PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-]
+    status = await message.reply_text(
+        "⏳ <b>جاري المعالجة...</b>",
+        parse_mode=ParseMode.HTML)
 
-# ==========================================
-# 💾 قاعدة البيانات والحفظ (JSON)
-# ==========================================
-USERS = {} 
-CODES = {}
-CHANNELS = []
-USER_ACCOUNTS = {}
-
-def save_data():
-    data = {"users": USERS, "codes": CODES, "channels": CHANNELS, "accounts": USER_ACCOUNTS}
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-def load_data():
-    global USERS, CODES, CHANNELS, USER_ACCOUNTS
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                USERS = data.get("users", {})
-                CODES = data.get("codes", {})
-                CHANNELS = data.get("channels", [])
-                USER_ACCOUNTS = data.get("accounts", {})
-        except Exception as e:
-            print(c(f"[Storage] Load error: {e}", r))
-
-def get_user(uid):
-    uid = str(uid)
-    if uid not in USERS:
-        USERS[uid] = {"exp": 0, "lang": "ar", "max_acc": 3, "blocked": False, "starts": 0, "speed": "normal", "work_hours": 16}
-    return USERS[uid]
-
-# ==========================================
-# 🌐 الترجمات
-# ==========================================
-TEXTS = {
-    "ar": {
-        "menu": "🏠 *القائمة الرئيسية*\n\n👤 النشط: `{}` | ⭐ *{}*\n📋 الحسابات: *{}* من أصل *{}*\n⏳ الاشتراك ينتهي: *{}*",
-        "farm": "🟢 تجميع", "all": "🔥 الكل", "followers": "🔵 متابعين", "likes": "🔴 لايكات", "views": "🟡 مشاهدات", "comments": "🟣 تعليقات",
-        "accs": "📋 الحسابات", "add": "➕ إضافة", "stats": "📊 إحصائيات", "lang": "🌐 اللغة", "code": "🔑 تفعيل رمز",
-        "back": "🔙 رجوع للقائمة الرئيسية", "start": "▶️ بدء", "stop": "🛑 إيقاف", "back_dev": "👑 عودة للوحة المطور",
-        "join": "✅ تحقق من الاشتراك", "must_join": "🔐 اشترك في القنوات أولاً:",
-        "expired": "⚠️ اشتراكك منتهي. أرسل رمز التفعيل:", "banned": "🚫 أنت محظور.",
-        "code_ok": "✅ تم التفعيل بنجاح!", "code_bad": "❌ رمز خاطئ.",
-        "price": "💰 *الأسعار الحالية*\n\n🔵 متابعين: {} نقطة\n🔴 لايكات: {} نقطة\n🟡 مشاهدات: {} نقطة\n🟣 تعليقات: {} نقطة\n\nأرسل الكمية والرابط في رسالة واحدة.",
-        "dev": "👑 *لوحة تحكم المطور*\n\nيمكنك إدارة البوت بالكامل من هنا:",
-        "gen": "🔑 توليد كود", "users": "👥 إدارة المستخدمين", "switch": "👤 الدخول كـ مستخدم",
-        "add_ch": "➕ إضافة قناة", "del_ch": "🗑 حذف قناة", "update_code": "📤 تحديث الكود",
-        "ask_code": "أرسل رمز التفعيل الآن:", "ask_user": "أرسل يوزر تيك توك:", "ask_pass": "أرسل كلمة المرور:",
-        "ask_ch_add": "أرسل معرف القناة (مثال: `@my_channel`):",
-        "ask_duration": "⏳ أرسل مدة الاشتراك:\n\n📌 *للأيام:* `5d`\n📌 *للساعات:* `10h`\n📌 *للأشهر:* `1m`\n\n(إذا أرسلت رقماً فقط، سيتم اعتباره أياماً)",
-        "ch_added": "✅ تم إضافة القناة بنجاح!", "ch_del": "✅ تم حذف القناة!", "no_ch": "لا توجد قنوات لحذفها.",
-        "ask_uid": "أرسل آيدي (ID) المستخدم الذي تريد إدارته:",
-        "mu_title": "⚙️ *إدارة المستخدم:* `{}`\n\n📋 عدد الحسابات: *{}*\n🔢 الحد الأقصى: *{}*\n⚡ السرعة: *{}*\n⏳ ساعات العمل: *{}*",
-        "ask_limit": "أرسل الرقم الجديد للحد الأقصى للحسابات (مثال: 5):",
-        "ask_hours": "أرسل عدد ساعات العمل (مثال: 12 أو 16):",
-        "speed_changed": "✅ تم تغيير سرعة المستخدم إلى: *{}*",
-        "limit_changed": "✅ تم تغيير الحد الأقصى إلى: *{}*",
-        "hours_changed": "✅ تم تغيير ساعات العمل إلى: *{}* ساعة",
-        "user_not_found": "❌ هذا المستخدم غير موجود في قاعدة البيانات.",
-        "ask_file": "📤 أرسل ملف البايثون (`.py`) الجديد الآن، وسأقوم باستبدال الكود وإعادة التشغيل فوراً:",
-        "updating": "⏳ جاري استلام الملف واستبداله...",
-        "bad_file": "❌ خطأ: يجب أن يكون الملف بصيغة `.py` فقط."
-    },
-    "en": {
-        "menu": "🏠 *Main Menu*\n\n👤 Active: `{}` | ⭐ *{}*\n📋 Accounts: *{} / {}*\n⏳ Sub: *{}*",
-        "farm": "🟢 Farm", "all": "🔥 All", "followers": "🔵 Followers", "likes": "🔴 Likes", "views": "🟡 Views", "comments": "🟣 Comments",
-        "accs": "📋 Accounts", "add": "➕ Add", "stats": "📊 Stats", "lang": "🌐 Language", "code": "🔑 Enter Code",
-        "back": "🔙 Back to Main Menu", "start": "▶️ Start", "stop": "🛑 Stop", "back_dev": "👑 Back to Dev Panel",
-        "join": "✅ Check Join", "must_join": "🔐 Join channels first:",
-        "expired": "⚠️ Subscription expired. Send code:", "banned": "🚫 You are banned.",
-        "code_ok": "✅ Activated successfully!", "code_bad": "❌ Invalid code.",
-        "price": "💰 *Prices*\n\n🔵 Followers: {}\n🔴 Likes: {}\n🟡 Views: {}\n🟣 Comments: {}\n\nSend amount and link in one message.",
-        "dev": "👑 *Dev Panel*",
-        "gen": "🔑 Gen Code", "users": "👥 Users", "switch": "👤 Switch to User",
-        "add_ch": "➕ Add Channel", "del_ch": "🗑 Delete Channel", "update_code": "📤 Update Code",
-        "ask_code": "Send code:", "ask_user": "Send TikTok Username:", "ask_pass": "Send Password:",
-        "ask_ch_add": "Send channel ID (e.g., `@my_channel`):",
-        "ask_duration": "⏳ Send duration:\n\n📌 *Days:* `5d`\n📌 *Hours:* `10h`\n📌 *Months:* `1m`",
-        "ch_added": "✅ Channel added!", "ch_del": "✅ Channel deleted!", "no_ch": "No channels to delete.",
-        "ask_uid": "Send user ID to manage:",
-        "mu_title": "⚙️ *Manage User:* `{}`\n\n📋 Accounts: *{}*\n🔢 Max Limit: *{}*\n⚡ Speed: *{}*\n⏳ Work Hours: *{}*",
-        "ask_limit": "Send new max accounts limit (e.g., 5):",
-        "ask_hours": "Send work hours (e.g., 12 or 16):",
-        "speed_changed": "✅ Speed changed to: *{}*",
-        "limit_changed": "✅ Max limit changed to: *{}*",
-        "hours_changed": "✅ Work hours changed to: *{}* hours",
-        "user_not_found": "❌ User not found in database.",
-        "ask_file": "📤 Send the new Python file (`.py`) now to replace code and restart:",
-        "updating": "⏳ Receiving file and replacing...",
-        "bad_file": "❌ Error: File must be `.py`."
-    }
-}
-
-def t(uid, key):
-    lang = get_user(uid).get("lang", "ar")
-    return TEXTS.get(lang, TEXTS["ar"]).get(key, key)
-
-# ==========================================
-# 🛡️ نظام البروكسيات (Proxy Pool)
-# ==========================================
-class ProxyEndpoint:
-    def __init__(self, url):
-        self.url = url
-        self.failures = 0
-        self.banned_until = None
-    def is_available(self):
-        return not (self.banned_until and datetime.now(timezone.utc) < self.banned_until)
-    def mark_failed(self):
-        self.failures += 1
-        self.banned_until = datetime.now(timezone.utc) + timedelta(seconds=min(60 * (2 ** max(self.failures-1, 0)), 3600))
-    def mark_ok(self):
-        self.failures = 0
-        self.banned_until = None
-
-class ProxyPool:
-    def __init__(self):
-        self.proxies = []
-        self._lock = threading.Lock()
-    def acquire(self):
-        with self._lock:
-            avail = [p for p in self.proxies if p.is_available()]
-        return random.choice(avail) if avail else None
-    def add(self, url):
-        with self._lock:
-            if not any(p.url == url for p in self.proxies):
-                self.proxies.append(ProxyEndpoint(url))
-
-proxy_pool = ProxyPool()
-
-def _download_raw():
-    raw = set()
-    def fetch(url):
-        try:
-            r = requests.get(url, timeout=10)
-            return [l.strip() for l in r.text.splitlines() if l.strip() and not l.startswith("#")]
-        except: return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        for lines in ex.map(fetch, FREE_PROXY_SOURCES): raw.update(lines)
-    return raw
-
-def _validate_proxy(proxy_url):
     try:
-        s = requests.Session(); s.trust_env = False
-        s.proxies = {"http": proxy_url, "https": proxy_url}
-        r = s.get("https://api.ipify.org", timeout=5)
-        return r.status_code == 200
-    except: return False
-
-def fetch_free_proxies():
-    raw = _download_raw()
-    normalized = ["http://" + p if "://" not in p else p for p in raw]
-    fresh = [p for p in normalized if not any(px.url == p for px in proxy_pool.proxies)][:50]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        for url, ok in zip(fresh, ex.map(_validate_proxy, fresh)):
-            if ok: proxy_pool.add(url)
-    print(c(f"[Proxy] ✅ Updated proxies. Available: {len(proxy_pool.proxies)}", G))
-
-# ==========================================
-# 🌐 دوال الـ API
-# ==========================================
-def sign(ts, nonce, payload):
-    return hmac.new(secretkey, f"{ts}-{nonce}-{payload}".encode(), hashlib.sha256).hexdigest()
-
-def req(token, csrf, payload, op, auth=True, proxy_url=None):
-    try:
-        p_str = json.dumps(payload, separators=(',', ':'))
-        ts, nonce = str(int(time.time()*1000)), str(uuid.uuid4())[:16]
-        headers = {
-            "X-APOLLO-OPERATION-NAME": op, "Content-Type": "application/json",
-            "x-app-sig": sign(ts, nonce, p_str), "x-app-ts": ts, "x-app-nonce": nonce,
-            "x-app-name": "com.dev.vidspark", "x-device-info": DEFAULT_DEVINFO,
-            "User-Agent": random.choice(USER_AGENTS), "Accept-Encoding": "gzip"
-        }
-        if auth: headers["token"], headers["x-csrf-token"] = token, csrf
-        
-        s = requests.Session(); s.trust_env = False
-        if proxy_url: s.proxies = {"http": proxy_url, "https": proxy_url}
-        
-        r = s.post(ENDPOINT, headers=headers, data=p_str, timeout=(10, 20))
-        r.raise_for_status()
-        return r, r.json()
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code in BAN_CODES: return None, {"__banned__": True}
-        return None, {"error": str(e)}
+        tweet_media = await fetch_tweet_media(tweet_id)
     except Exception as e:
-        return None, {"error": str(e)}
-
-def req_with_retry(token, csrf, payload, op, auth, acc):
-    for attempt in range(3):
-        proxy = acc.get("proxy") if acc else None
-        pu = proxy.url if proxy else None
-        resp, res = req(token, csrf, payload, op, auth, pu)
-        
-        if res and "error" not in res and "__banned__" not in res:
-            if proxy: proxy.mark_ok()
-            return resp, res
-            
-        if proxy: proxy.mark_failed()
-        if acc: acc["proxy"] = proxy_pool.acquire()
-        time.sleep(2)
-    return None, {"error": "Failed after retries"}
-
-async def try_relogin(uid, uname):
-    acc = USER_ACCOUNTS.get(str(uid), {}).get(uname)
-    if not acc or not acc.get("password"): return False
-    payload = {"operationName": "LoginAccount", "variables": {"data": {"uniqueId": uname, "password": acc["password"], "authMethod": "local"}}, "query": "mutation LoginAccount($data: TiktokInfo) { loginTiktok(data: $data) { accessToken user { score } } }"}
-    resp, res = await asyncio.to_thread(req, "", "", payload, "LoginAccount", False)
-    if resp and res and "data" in res:
-        acc["token"] = res["data"]["loginTiktok"]["accessToken"]
-        acc["csrf"] = resp.headers.get("x-csrf-token") or DEFAULT_CSRF
-        acc["_needs_relogin"] = False
-        save_data()
-        return True
-    return False
-
-async def fetch_prices():
-    global DYNAMIC_PRICES
-    query = "query GetServices { getServices { type price } }"
-    try:
-        resp = await asyncio.to_thread(requests.post, ENDPOINT, json={"query": query}, timeout=10)
-        if resp.status_code == 200:
-            for srv in resp.json().get("data", {}).get("getServices", []):
-                DYNAMIC_PRICES[srv.get("type").lower()] = float(srv.get("price", 1.0))
-    except: pass
-
-# ==========================================
-# 🚜 دالة التجميع (تقرأ السرعة والساعات)
-# ==========================================
-async def farm_task(uid, uname, context):
-    accs = USER_ACCOUNTS.get(str(uid), {})
-    acc = accs.get(uname)
-    if not acc: return
-    start = time.time()
-    
-    while acc.get("farming"):
-        user = get_user(uid)
-        work_hours = user.get("work_hours", 16)
-        speed = user.get("speed", "normal")
-        work_seconds = work_hours * 3600
-        
-        if time.time() - start > work_seconds:
-            acc["farming"] = False
-            rest_hours = 24 - work_hours
-            try: await context.bot.send_message(uid, f"⏳ الحساب {uname} أكمل {work_hours} ساعة. راحة {rest_hours} ساعة.")
-            except: pass
-            await asyncio.sleep(rest_hours * 3600)
-            acc["farming"] = True
-            start = time.time()
-
-        if acc.get("_needs_relogin"):
-            if not await try_relogin(uid, uname):
-                await asyncio.sleep(60); continue
-            
         try:
-            payload = {"operationName": "GetOrders", "variables": {}, "query": "query GetOrders { getOrders { _id status } }"}
-            _, res = await asyncio.to_thread(req_with_retry, acc["token"], acc["csrf"], payload, "GetOrders", True, acc)
-            
-            if res and "data" in res:
-                pending = [o["_id"] for o in res["data"].get("getOrders", []) if o.get("status") == "pending"]
-                for tid in pending:
-                    if not acc.get("farming"): break
-                    rn = random.randint(3000, 4500)
-                    ap = {"operationName":"ActionOrder","variables":{"orderId":tid,"validationData":{"attempts":1,"initialNumber":float(rn),"timeSpent":4000,"actualCount":rn+1,"source":"CLIENT_CRONET"}},"query":"mutation ActionOrder($orderId: ID!, $validationData: ValidationDataInput!) { actionOrder(orderId: $orderId, validationData: $validationData) { score } }"}
-                    _, ar = await asyncio.to_thread(req_with_retry, acc["token"], acc["csrf"], ap, "ActionOrder", True, acc)
-                    if ar and "data" in ar:
-                        acc["score"] += int(ar["data"].get("actionOrder", {}).get("score", 0))
-                        save_data()
-                    
-                    if speed == "fast": await asyncio.sleep(1)
-                    elif speed == "slow": await asyncio.sleep(4)
-                    else: await asyncio.sleep(2)
+            await status.edit_text(
+                f"❌ <code>{str(e)[:300]}</code>",
+                parse_mode=ParseMode.HTML)
+        except TelegramError: pass
+        return False
+
+    items = extract_media_items(tweet_media)
+    if not items:
+        try:
+            await status.edit_text("⚠️ لا وسائط.")
+        except TelegramError: pass
+        return False
+
+    post_url = tweet_media.get("tweetURL", url)
+    caption_text = build_caption(post_url)
+    request_id = uuid.uuid4().hex[:8]
+
+    for idx, item in enumerate(items):
+        ext = os.path.splitext(
+            urlsplit(item["url"]).path)[1]
+        if not ext:
+            ext = ".jpg" if item["type"] == "photo" else ".mp4"
+        fname = f"single_{tweet_id}_{idx}_{request_id}{ext}"
+        temp_path = None
+
+        try:
+            temp_path = await downloader.download(
+                item["url"], fname)
+            if os.path.getsize(temp_path) > MAX_FILE_SIZE:
+                continue
+
+            media_id = build_media_id(item["url"])
+            if item["type"] == "video":
+                await send_video_file(
+                    message.chat_id, context, temp_path,
+                    caption=caption_text,
+                    reply_markup=media_actions_keyboard(media_id))
             else:
-                await asyncio.sleep(10)
-        except asyncio.CancelledError: break
-        except: await asyncio.sleep(5)
+                await send_single_photo(
+                    message.chat_id, context, temp_path,
+                    caption=caption_text,
+                    reply_markup=media_actions_keyboard(media_id))
+            caption_text = None
 
-# ==========================================
-# 🔘 تصميم الأزرار
-# ==========================================
-def get_main_kb(uid, is_owner=False):
-    accs = USER_ACCOUNTS.get(str(uid), {})
-    active = accs.get("_active", "None")
-    score = accs.get(active, {}).get("score", 0)
-    
-    kb = [
-        [InlineKeyboardButton(f"👤 {active} | ⭐ {score}", callback_data="accs")],
-        [InlineKeyboardButton(t(uid, "farm"), callback_data="farm_menu"), InlineKeyboardButton(t(uid, "all"), callback_data="farm_all")],
-        [InlineKeyboardButton(t(uid, "followers"), callback_data="prices"), InlineKeyboardButton(t(uid, "likes"), callback_data="prices")],
-        [InlineKeyboardButton(t(uid, "views"), callback_data="prices"), InlineKeyboardButton(t(uid, "comments"), callback_data="prices")],
-        [InlineKeyboardButton(t(uid, "accs"), callback_data="accs"), InlineKeyboardButton(t(uid, "add"), callback_data="add_acc")],
-        [InlineKeyboardButton(t(uid, "stats"), callback_data="stats"), InlineKeyboardButton(t(uid, "lang"), callback_data="lang_menu")],
-        [InlineKeyboardButton(t(uid, "code"), callback_data="enter_code")]
-    ]
-    if is_owner: kb.append([InlineKeyboardButton(t(uid, "back_dev"), callback_data="back_to_dev")])
-    return InlineKeyboardMarkup(kb)
-
-def get_dev_kb(uid):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(uid, "gen"), callback_data="dev_gen"), InlineKeyboardButton(t(uid, "users"), callback_data="dev_users")],
-        [InlineKeyboardButton(t(uid, "add_ch"), callback_data="dev_add_ch"), InlineKeyboardButton(t(uid, "del_ch"), callback_data="dev_del_ch")],
-        [InlineKeyboardButton(t(uid, "update_code"), callback_data="dev_update_code")],
-        [InlineKeyboardButton(t(uid, "switch"), callback_data="switch_user")]
-    ])
-
-def get_back_kb(uid):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data="back")]])
-
-def get_manage_user_kb(target_id):
-    user = get_user(target_id)
-    accs = USER_ACCOUNTS.get(str(target_id), {})
-    speed_val = user.get("speed", "normal")
-    speed_txt = {"fast": "🚀 سريع", "normal": "⚖️ عادي", "slow": "🐢 بطيء"}.get(speed_val, speed_val)
-    
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📋 حسابات المستخدم ({len([k for k in accs if k != '_active'])})", callback_data=f"view_accs_{target_id}")],
-        [InlineKeyboardButton(f"🔢 الحد الأقصى: {user.get('max_acc', 3)}", callback_data=f"set_lim_{target_id}")],
-        [InlineKeyboardButton(f"⚡ السرعة: {speed_txt}", callback_data=f"toggle_speed_{target_id}")],
-        [InlineKeyboardButton(f"⏳ ساعات العمل: {user.get('work_hours', 16)}", callback_data=f"set_hours_{target_id}")],
-        [InlineKeyboardButton(t(OWNER_ID, "back"), callback_data="back_to_dev")]
-    ])
-
-# ==========================================
-# 🚀 الأوامر الأساسية
-# ==========================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-    is_user_mode = context.user_data.get("is_user_mode", False)
-    
-    asyncio.create_task(fetch_prices())
-
-    if uid == OWNER_ID and not is_user_mode:
-        return await update.effective_message.reply_text(t(uid, "dev"), reply_markup=get_dev_kb(uid), parse_mode=ParseMode.MARKDOWN)
-
-    if user["blocked"]: return await update.effective_message.reply_text(t(uid, "banned"))
-    if CHANNELS:
-        kb = [[InlineKeyboardButton(f"📢 {ch}", url=f"https://t.me/{ch.replace('@','')}")] for ch in CHANNELS]
-        kb.append([InlineKeyboardButton(t(uid, "join"), callback_data="check_join")])
-        return await update.effective_message.reply_text(t(uid, "must_join"), reply_markup=InlineKeyboardMarkup(kb))
-
-    if user["exp"] < time.time():
-        user["starts"] += 1
-        if user["starts"] > 5: user["blocked"] = True; save_data(); return await update.effective_message.reply_text(t(uid, "banned"))
-        save_data()
-        context.user_data["awaiting"] = "code"
-        return await update.effective_message.reply_text(t(uid, "expired"))
-    
-    user["starts"] = 0
-    save_data()
-    
-    accs = USER_ACCOUNTS.setdefault(str(uid), {})
-    active = accs.get("_active", "None")
-    score = accs.get(active, {}).get("score", 0)
-    days = round((user["exp"] - time.time()) / 86400, 1)
-    
-    text = t(uid, "menu").format(active, score, len([k for k in accs if k != "_active"]), user.get("max_acc", 3), days)
-    await update.effective_message.reply_text(text, reply_markup=get_main_kb(uid, is_owner=(uid==OWNER_ID)), parse_mode=ParseMode.MARKDOWN)
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = update.effective_user.id
-    data = q.data
-    accs = USER_ACCOUNTS.setdefault(str(uid), {})
-    user = get_user(uid)
-
-    if data == "back":
-        context.user_data.clear()
-        await start(update, context)
-    elif data == "check_join":
-        await start(update, context) 
-    
-    # ================= قوائم المطور =================
-    elif data == "switch_user":
-        context.user_data["is_user_mode"] = True
-        if user["exp"] < time.time(): user["exp"] = time.time() + (365*86400)
-        await start(update, context)
-    elif data == "back_to_dev":
-        context.user_data["is_user_mode"] = False
-        context.user_data.clear()
-        await start(update, context)
-        
-    elif data == "dev_update_code":
-        context.user_data["awaiting"] = "update_code"
-        await q.edit_message_text(t(uid, "ask_file"), reply_markup=get_back_kb(uid), parse_mode=ParseMode.MARKDOWN)
-        
-    elif data == "dev_gen":
-        context.user_data["awaiting"] = "gen_duration"
-        await q.edit_message_text(t(uid, "ask_duration"), reply_markup=get_back_kb(uid), parse_mode=ParseMode.MARKDOWN)
-        
-    elif data == "dev_add_ch":
-        context.user_data["awaiting"] = "add_channel"
-        await q.edit_message_text(t(uid, "ask_ch_add"), reply_markup=get_back_kb(uid), parse_mode=ParseMode.MARKDOWN)
-        
-    elif data == "dev_del_ch":
-        if not CHANNELS: return await q.answer(t(uid, "no_ch"), show_alert=True)
-        kb = [[InlineKeyboardButton(f"❌ {ch}", callback_data=f"del_ch_{ch}")] for ch in CHANNELS]
-        kb.append([InlineKeyboardButton(t(uid, "back"), callback_data="back_to_dev")])
-        await q.edit_message_text("🗑 اختر القناة لحذفها:", reply_markup=InlineKeyboardMarkup(kb))
-        
-    elif data.startswith("del_ch_"):
-        ch = data.replace("del_ch_", "")
-        if ch in CHANNELS: CHANNELS.remove(ch); save_data()
-        await q.edit_message_text(t(uid, "ch_del"), reply_markup=get_back_kb(uid), parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "dev_users":
-        context.user_data["awaiting"] = "manage_uid"
-        await q.edit_message_text(t(uid, "ask_uid"), reply_markup=get_back_kb(uid))
-        
-    elif data.startswith("view_accs_"):
-        target_id = data.split("_")[2]
-        target_accs = USER_ACCOUNTS.get(str(target_id), {})
-        if not target_accs: return await q.answer("لا توجد حسابات لهذا المستخدم.", show_alert=True)
-            
-        txt = f"📋 *حسابات المستخدم `{target_id}`:*\n\n"
-        for k, v in target_accs.items():
-            if k != "_active":
-                txt += f"👤 `{k}`: ⭐ {v.get('score', 0)} | {'✅ شغال' if v.get('farming') else '❌ متوقف'}\n"
-        kb = [[InlineKeyboardButton(t(uid, "back"), callback_data=f"back_manage_{target_id}")]]
-        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-        
-    elif data.startswith("back_manage_"):
-        target_id = data.split("_")[2]
-        target_user = get_user(target_id)
-        speed_txt = {"fast": "🚀 سريع", "normal": "⚖️ عادي", "slow": "🐢 بطيء"}.get(target_user.get("speed", "normal"))
-        text = t(uid, "mu_title").format(target_id, len([k for k in USER_ACCOUNTS.get(str(target_id), {}) if k != '_active']), target_user.get("max_acc", 3), speed_txt, target_user.get("work_hours", 16))
-        await q.edit_message_text(text, reply_markup=get_manage_user_kb(target_id), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith("toggle_speed_"):
-        target_id = data.split("_")[2]
-        target_user = get_user(target_id)
-        current = target_user.get("speed", "normal")
-        new_speed = "slow" if current == "normal" else "fast" if current == "slow" else "normal"
-        target_user["speed"] = new_speed
-        save_data()
-        speed_txt = {"fast": "🚀 سريع", "normal": "⚖️ عادي", "slow": "🐢 بطيء"}.get(new_speed)
-        await q.answer(t(uid, "speed_changed").format(speed_txt), show_alert=True)
-        text = t(uid, "mu_title").format(target_id, len([k for k in USER_ACCOUNTS.get(str(target_id), {}) if k != '_active']), target_user.get("max_acc", 3), speed_txt, target_user.get("work_hours", 16))
-        await q.edit_message_text(text, reply_markup=get_manage_user_kb(target_id), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith("set_lim_"):
-        target_id = data.split("_")[2]
-        context.user_data["awaiting"] = "mu_limit"
-        context.user_data["target_id"] = target_id
-        await q.edit_message_text(t(uid, "ask_limit"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data=f"back_manage_{target_id}")]]))
-
-    elif data.startswith("set_hours_"):
-        target_id = data.split("_")[2]
-        context.user_data["awaiting"] = "mu_hours"
-        context.user_data["target_id"] = target_id
-        await q.edit_message_text(t(uid, "ask_hours"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data=f"back_manage_{target_id}")]]))
-
-    # ================= قوائم المستخدم =================
-    elif data == "prices":
-        txt = t(uid, "price").format(DYNAMIC_PRICES["followers"], DYNAMIC_PRICES["likes"], DYNAMIC_PRICES["views"], DYNAMIC_PRICES["comments"])
-        await q.edit_message_text(txt, reply_markup=get_back_kb(uid), parse_mode=ParseMode.MARKDOWN)
-    elif data == "enter_code":
-        context.user_data["awaiting"] = "code"
-        await q.edit_message_text(t(uid, "ask_code"), reply_markup=get_back_kb(uid))
-    elif data == "add_acc":
-        if len([k for k in accs if k != "_active"]) >= user.get("max_acc", 3):
-            return await q.answer(f"الحد الأقصى {user.get('max_acc', 3)} حسابات!", show_alert=True)
-        context.user_data["awaiting"] = "acc_user"
-        await q.edit_message_text(t(uid, "ask_user"), reply_markup=get_back_kb(uid))
-    elif data == "accs":
-        kb = [[InlineKeyboardButton(f"👤 {k} ⭐{v.get('score',0)}", callback_data=f"sw_{k}")] for k, v in accs.items() if k != "_active"]
-        kb.append([InlineKeyboardButton(t(uid, "add"), callback_data="add_acc")])
-        kb.append([InlineKeyboardButton(t(uid, "back"), callback_data="back")])
-        await q.edit_message_text(t(uid, "accs"), reply_markup=InlineKeyboardMarkup(kb))
-    elif data.startswith("sw_"):
-        accs["_active"] = data.split("_")[1]
-        await start(update, context)
-    elif data == "farm_menu":
-        active = accs.get("_active")
-        if not active: return await q.answer("أضف حساباً أولاً!", show_alert=True)
-        is_f = accs[active].get("farming", False)
-        kb = [[InlineKeyboardButton(t(uid, "stop") if is_f else t(uid, "start"), callback_data="stop_f" if is_f else "start_f")], [InlineKeyboardButton(t(uid, "back"), callback_data="back")]]
-        await q.edit_message_text(f"حالة التجميع للحساب `{active}`:", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    elif data == "start_f":
-        active = accs.get("_active")
-        if active and not accs[active].get("farming"):
-            accs[active]["farming"] = True
-            asyncio.create_task(farm_task(uid, active, context))
-        await start(update, context)
-    elif data == "stop_f":
-        active = accs.get("_active")
-        if active: accs[active]["farming"] = False
-        await start(update, context)
-    elif data == "stats":
-        if not HAS_MPL: return await q.answer("الرسم البياني غير مدعوم في هذه البيئة.", show_alert=True)
-        
-        total = sum(v.get("score",0) for k,v in accs.items() if k != "_active")
-        if not accs: return await q.edit_message_text("لا توجد حسابات.", reply_markup=get_back_kb(uid))
-        
-        labels = [k for k in accs.keys() if k != "_active"]
-        scores = [accs[k].get("score", 0) for k in labels]
-        
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(labels, scores, color="#3b82f6")
-        ax.set_title(f"Total Score: {total}")
-        buf = io.BytesIO(); plt.tight_layout(); plt.savefig(buf, format="png"); plt.close(); buf.seek(0)
-        
-        await q.message.reply_photo(photo=buf, caption="📊 إحصائيات حساباتك")
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    aw = context.user_data.get("awaiting")
-    accs = USER_ACCOUNTS.setdefault(str(uid), {})
-
-    if aw == "manage_uid" and uid == OWNER_ID:
-        target_id = text
-        if target_id not in USERS: return await update.message.reply_text(t(uid, "user_not_found"))
-        target_user = get_user(target_id)
-        speed_txt = {"fast": "🚀 سريع", "normal": "⚖️ عادي", "slow": "🐢 بطيء"}.get(target_user.get("speed", "normal"))
-        text_out = t(uid, "mu_title").format(target_id, len([k for k in USER_ACCOUNTS.get(target_id, {}) if k != '_active']), target_user.get("max_acc", 3), speed_txt, target_user.get("work_hours", 16))
-        context.user_data.clear()
-        await update.message.reply_text(text_out, reply_markup=get_manage_user_kb(target_id), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if aw == "mu_limit" and uid == OWNER_ID:
-        try:
-            limit = int(text)
-            target_id = context.user_data.get("target_id")
-            get_user(target_id)["max_acc"] = limit
-            save_data()
-            context.user_data.clear()
-            await update.message.reply_text(t(uid, "limit_changed").format(limit), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data=f"back_manage_{target_id}")]]))
-        except: await update.message.reply_text("❌ أرسل رقماً صحيحاً.")
-        return
-
-    if aw == "mu_hours" and uid == OWNER_ID:
-        try:
-            hours = int(text)
-            if hours > 24 or hours < 1: raise ValueError
-            target_id = context.user_data.get("target_id")
-            get_user(target_id)["work_hours"] = hours
-            save_data()
-            context.user_data.clear()
-            await update.message.reply_text(t(uid, "hours_changed").format(hours), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data=f"back_manage_{target_id}")]]))
-        except: await update.message.reply_text("❌ أرسل رقماً صحيحاً بين 1 و 24.")
-        return
-
-    if aw == "gen_duration" and uid == OWNER_ID:
-        seconds, desc = parse_duration(text)
-        if not seconds: return await update.message.reply_text("❌ صيغة خاطئة. أرسل `5d` أو `10h` أو `1m`")
-        c = str(uuid.uuid4())[:6].upper()
-        CODES[c] = {"seconds": seconds, "used": False}
-        save_data()
-        context.user_data.clear()
-        await update.message.reply_text(f"✅ الكود: `{c}`\n⏳ المدة: {desc}", parse_mode=ParseMode.MARKDOWN, reply_markup=get_back_kb(uid))
-        return
-
-    if aw == "add_channel" and uid == OWNER_ID:
-        ch = text if text.startswith("@") or text.startswith("-") else "@" + text
-        if ch not in CHANNELS: CHANNELS.append(ch); save_data()
-        context.user_data.clear()
-        await update.message.reply_text(t(uid, "ch_added"), reply_markup=get_back_kb(uid))
-        return
-
-    if aw == "code":
-        if text in CODES and not CODES[text]["used"]:
-            CODES[text]["used"] = True
-            secs = CODES[text].get("seconds", 86400)
-            get_user(uid)["exp"] = max(time.time(), get_user(uid).get("exp", 0)) + secs
-            save_data()
-            await update.message.reply_text(t(uid, "code_ok"))
-            await start(update, context)
-        else: await update.message.reply_text(t(uid, "code_bad"))
-        context.user_data.clear()
-    elif aw == "acc_user":
-        context.user_data["temp_u"] = text
-        context.user_data["awaiting"] = "acc_pass"
-        await update.message.reply_text(t(uid, "ask_pass"))
-    elif aw == "acc_pass":
-        uname, pwd = context.user_data.pop("temp_u"), text
-        context.user_data.clear()
-        msg = await update.message.reply_text("⏳ جاري الدخول...")
-        payload = {"operationName":"LoginAccount","variables":{"data":{"uniqueId":uname,"password":pwd,"authMethod":"local"}},"query":"mutation LoginAccount($data: TiktokInfo) { loginTiktok(data: $data) { accessToken user { score } } }"}
-        r, res = await asyncio.to_thread(req, "", "", payload, "LoginAccount", False)
-        if r and res and "data" in res:
-            accs[uname] = {"token": res["data"]["loginTiktok"]["accessToken"], "csrf": r.headers.get("x-csrf-token",""), "score": res["data"]["loginTiktok"]["user"].get("score",0), "farming": False, "password": pwd, "proxy": proxy_pool.acquire()}
-            accs["_active"] = uname
-            save_data()
-            await msg.edit_text("✅ تم الإضافة!")
-            await start(update, context)
-        else: await msg.edit_text("❌ فشل الدخول. تأكد من البيانات.")
-
-# ==========================================
-# 📤 استقبال الملفات لتحديث الكود
-# ==========================================
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != OWNER_ID: return
-    
-    aw = context.user_data.get("awaiting")
-    if aw == "update_code":
-        document = update.message.document
-        if not document.file_name.endswith(".py"):
-            return await update.message.reply_text(t(uid, "bad_file"))
-            
-        msg = await update.message.reply_text(t(uid, "updating"))
-        
-        try:
-            file = await context.bot.get_file(document.file_id)
-            current_script = os.path.abspath(__file__)
-            
-            if os.path.exists(current_script):
-                os.remove(current_script)
-                
-            await file.download_to_drive(current_script)
-            
-            await msg.edit_text("✅ تم استبدال الملف بنجاح!\n🔄 جاري إعادة تشغيل البوت...")
-            await asyncio.sleep(2) 
-            
-            os.execv(sys.executable, ['python'] + sys.argv)
-            
         except Exception as e:
-            await msg.edit_text(f"❌ حدث خطأ أثناء التحديث: {e}")
-        context.user_data.clear()
+            logger.exception("Send: {}", e)
+        finally:
+            # 🗑️ حذف فوري
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError: pass
+
+    mark_processed(tweet_id)
+
+    try:
+        await status.delete()
+    except TelegramError: pass
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════
+#  شاشات
+# ═══════════════════════════════════════════════════════════════
+
+async def show_main_menu(update, context, edit=True):
+    user = update.effective_user
+    text = main_menu_text(user)
+    kb = main_menu_keyboard()
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=kb)
+            return
+        except TelegramError: pass
+    if update.callback_query:
+        await update.callback_query.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def show_howto(update, context):
+    kb = InlineKeyboardMarkup([[back_button()]])
+    try:
+        await update.callback_query.edit_message_text(
+            HOWTO_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=kb)
+    except TelegramError:
+        await update.callback_query.message.reply_text(
+            HOWTO_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=kb)
+
+
+async def show_batch100_prompt(update, context):
+    text = (
+        "╭──────────────────╮\n"
+        "     🎬 <b>تنزيل 100 فيديو</b>\n"
+        "╰──────────────────╯\n\n"
+        "📎 <b>أرسل:</b>\n"
+        "<code>/fetch100 @username</code>\n\n"
+        "📌 مثال:\n"
+        "<code>/fetch100 @elonmusk</code>\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💡 <b>ملاحظات:</b>\n"
+        f"• يجلب آخر <b>{BATCH_SIZE}</b> تغريدة\n"
+        "• ينزّل الفيديوهات/الصور واحداً واحداً\n"
+        "• 🗑️ يحذف كل ملف فور إرساله\n"
+        "• يُحفظ tweet_id فقط (JSON)\n"
+        "• ⏱️ قد يستغرق 10-30 دقيقة")
+    kb = InlineKeyboardMarkup([[back_button()]])
+    try:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError:
+        await update.callback_query.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  الأوامر
+# ═══════════════════════════════════════════════════════════════
+
+async def start_command(update, context):
+    user = update.effective_user
+    text = (
+        "╭──────────────────────────╮\n"
+        "   🚀 <b>مرحباً بك</b>\n"
+        "╰──────────────────────────╯\n\n"
+        "🔹 <b>تغريدة واحدة:</b> أرسل الرابط\n"
+        "🔹 <b>100 فيديو:</b> /fetch100 @username\n\n"
+        f"📦 الحد: <b>{human_size(MAX_FILE_SIZE)}</b>")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🚀  ابدأ", callback_data="menu:main")]])
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def menu_command(update, context):
+    await show_main_menu(update, context, edit=False)
+
+
+async def fetch100_command(update, context):
+    """أمر /fetch100 @username"""
+    if not context.args:
+        await update.message.reply_text(
+            "الاستخدام: <code>/fetch100 @username</code>",
+            parse_mode=ParseMode.HTML)
         return
 
-# ==========================================
-# ⏱️ دالة تحويل النص إلى وقت
-# ==========================================
-def parse_duration(text):
-    text = text.strip().lower()
-    try:
-        if text.endswith("h"): return float(text[:-1]) * 3600, f"{text[:-1]} ساعة"
-        elif text.endswith("d"): return float(text[:-1]) * 86400, f"{text[:-1]} يوم"
-        elif text.endswith("m"): return float(text[:-1]) * (30 * 86400), f"{text[:-1]} شهر"
-        else: return float(text) * 86400, f"{text} يوم"
-    except: return None, None
+    username = context.args[0].lstrip("@")
+    await process_batch_100(update, context, username)
 
-# ==========================================
-# 👑 أوامر المطور
-# ==========================================
-async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    try:
-        tid = str(context.args[0])
-        lim = int(context.args[1])
-        if tid not in USERS: USERS[tid] = {"exp": 0, "lang": "ar", "max_acc": lim, "blocked": False, "starts": 0, "speed": "normal", "work_hours": 16}
-        else: USERS[tid]["max_acc"] = lim
-        save_data()
-        await update.message.reply_text(f"✅ تم تعديل حد المستخدم `{tid}` لـ {lim}.", parse_mode=ParseMode.MARKDOWN)
-    except: await update.message.reply_text("⚠️ الصيغة: `/setlimit USER_ID NUMBER`", parse_mode=ParseMode.MARKDOWN)
 
-# ==========================================
-# 🚀 دالة التشغيل الرئيسية
-# ==========================================
+async def reset_command(update, context):
+    """يحذف ملف tracked_ids.json"""
+    if update.effective_user.id != DEVELOPER_ID:
+        return
+    if os.path.exists(TRACK_FILE):
+        os.remove(TRACK_FILE)
+    await update.message.reply_text(
+        "✅ <b>تم مسح سجل التغريدات</b>\n\n"
+        "الآن يمكنك إعادة تنزيل كل شيء.",
+        parse_mode=ParseMode.HTML)
+
+
+async def stats_command(update, context):
+    tracked = load_tracked()
+    downloads_dir = DOWNLOAD_DIR
+    files_count = 0
+    total_size = 0
+    if os.path.exists(downloads_dir):
+        for f in os.listdir(downloads_dir):
+            fp = os.path.join(downloads_dir, f)
+            if os.path.isfile(fp):
+                files_count += 1
+                total_size += os.path.getsize(fp)
+
+    text = (
+        "📊 <b>إحصائيات</b>\n\n"
+        f"📄 tweet_ids في JSON: <b>{len(tracked)}</b>\n"
+        f"📁 ملفات مؤقتة: <b>{files_count}</b>\n"
+        f"💾 حجم الملفات: <b>{human_size(total_size)}</b>\n\n"
+        "💡 الملفات المؤقتة تُحذف تلقائياً بعد كل إرسال.")
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  معالج الأزرار
+# ═══════════════════════════════════════════════════════════════
+
+async def callback_handler(update, context):
+    query = update.callback_query
+    data = query.data or ""
+    try: await query.answer()
+    except TelegramError: pass
+
+    if data == "menu:main":
+        await show_main_menu(update, context, edit=True)
+        return
+    if data == "menu:batch100":
+        await show_batch100_prompt(update, context)
+        return
+    if data == "menu:howto":
+        await show_howto(update, context)
+        return
+    if data == "menu:download":
+        text = ("📥 <b>تنزيل تغريدة</b>\n\n"
+                "أرسل رابط التغريدة مباشرة.")
+        kb = InlineKeyboardMarkup([[back_button()]])
+        try:
+            await query.edit_message_text(
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=kb)
+        except TelegramError: pass
+        return
+
+
+# ═══════════════════════════════════════════════════════════════
+#  معالج الرسائل
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_message(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user: return
+
+    if not message.text: return
+    text = message.text.strip()
+
+    match = URL_RE.search(text)
+    if not match:
+        await message.reply_text(
+            "❓ أرسل <b>رابط تغريدة</b> أو "
+            "<code>/fetch100 @username</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    url = match.group(0)
+    tweet_id = extract_tweet_id(url)
+    if not tweet_id:
+        await message.reply_text("❌ رابط غير صالح.")
+        return
+
+    try:
+        await process_single_tweet(
+            update, context, url, tweet_id)
+    except Exception as e:
+        logger.exception("Error: {}", e)
+        await message.reply_text(f"❌ خطأ: {str(e)[:200]}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  post_init + main
+# ═══════════════════════════════════════════════════════════════
+
+async def error_handler(update, context):
+    logger.error("Error: {}", context.error)
+    try:
+        await context.bot.send_message(
+            DEVELOPER_ID,
+            f"⚠️ خطأ:\n"
+            f"<code>{str(context.error)[:400]}</code>",
+            parse_mode=ParseMode.HTML)
+    except Exception: pass
+
+
 async def post_init(app):
-    # جلب البروكسيات في الخلفية عند بدء التشغيل
-    asyncio.create_task(asyncio.to_thread(fetch_free_proxies))
+    global BOT_USERNAME
+    try:
+        me = await app.bot.get_me()
+        BOT_USERNAME = me.username or ""
+        logger.info("Bot: @{}", BOT_USERNAME)
+        print(f"✅ Bot: @{BOT_USERNAME}")
+    except Exception as e:
+        logger.warning("Bot username: {}", e)
 
-def run_bot():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    
-    print(c("✅ Ultimate Bot is running...", f"{E1}{G}"))
-    app.run_polling(drop_pending_updates=True)
+    await app.bot.set_my_commands([
+        BotCommand("start", "🚀 بدء البوت"),
+        BotCommand("menu", "🏠 القائمة"),
+        BotCommand("fetch100", "🎬 تنزيل 100 فيديو"),
+        BotCommand("stats", "📊 إحصائيات"),
+        BotCommand("reset", "🔄 مسح السجل"),
+    ])
+
 
 def main():
-    load_data()
-    
-    # Supervisor Loop: يمنع البوت من التوقف عند حدوث خطأ
-    crashes = 0
-    while True:
-        try:
-            run_bot()
-            crashes = 0
-        except KeyboardInterrupt:
-            print(c("👋 Bot stopped manually.", Y))
-            return
-        except Exception as e:
-            crashes += 1
-            print(c(f"[Supervisor] 💥 Crash #{crashes}: {e}", r))
-            traceback.print_exc()
-            if "unauthorized" in str(e).lower() or "invalid token" in str(e).lower():
-                print(c("❌ خطأ في التوكن! البوت سيتوقف.", r))
-                time.sleep(60)
-                continue
-            time.sleep(min(5 * crashes, 60))
+    if (not BOT_TOKEN
+            or BOT_TOKEN == "ضع_توكن_البوت_هنا"):
+        print("⚠️ ضع توكن البوت")
+        sys.exit(1)
+    if "your-rsshub" in RSSHUB_BASE:
+        print("⚠️ ضع رابط RSSHub في RSSHUB_BASE")
+        sys.exit(1)
+
+    builder = Application.builder().token(BOT_TOKEN)
+    if USE_LOCAL_API:
+        builder = builder.base_url(LOCAL_API_URL)
+        builder = builder.base_file_url(LOCAL_API_FILE_URL)
+        builder = builder.local_mode(True)
+        print(f"🖥️ Local | {human_size(MAX_FILE_SIZE)}")
+    else:
+        print(f"☁️ Official | {human_size(MAX_FILE_SIZE)}")
+
+    app = builder.post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("fetch100", fetch100_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    msg_filter = ((filters.TEXT | filters.FORWARDED)
+                  & ~filters.COMMAND)
+    app.add_handler(MessageHandler(msg_filter, handle_message))
+    app.add_error_handler(error_handler)
+
+    logger.info("🤖 Bot starting...")
+    print("✅ البوت يعمل!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    def _sig(signum, frame):
-        raise KeyboardInterrupt
-    try: signal.signal(signal.SIGTERM, _sig)
-    except: pass
-    
     main()
