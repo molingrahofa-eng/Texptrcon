@@ -1,4 +1,2 @@
-python-telegram-bot==21.4
-httpx
-loguru
-feedparser
+python-telegram-bot
+requests
