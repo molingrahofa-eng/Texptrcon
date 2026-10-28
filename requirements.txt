@@ -1,5 +1,4 @@
-python-telegram-bot>=20.0
-requests
-cryptography
-matplotlib
-requests[socks]
+python-telegram-bot==21.4
+httpx
+loguru
+feedparser
