@@ -1,3 +1,4 @@
+import os
 import telebot
 from telebot import types
 import requests
@@ -5,8 +6,19 @@ import urllib3
 
 urllib3.disable_warnings()
 
-# ===== التوكن =====
-BOT_TOKEN = input("6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA").strip()
+# ===== قراءة التوكن (متغير بيئة أو config.py) =====
+BOT_TOKEN = os.getenv("BOT_TOKEN", "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA").strip()
+
+if not BOT_TOKEN:
+    try:
+        from config import BOT_TOKEN as CFG_TOKEN
+        BOT_TOKEN = CFG_TOKEN.strip()
+    except Exception:
+        BOT_TOKEN = ""
+
+if not BOT_TOKEN:
+    raise SystemExit("❌ ضع التوكن في متغير البيئة BOT_TOKEN أو في ملف config.py")
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ===== الستايلات =====
@@ -104,12 +116,8 @@ def dev_buttons(kb):
     )
     return kb
 
-# ===== إرسال الصور بجودة أصلية (بدون ضغط) =====
+# ===== إرسال الصور بجودة أصلية =====
 def send_images_hd(uid, urls, styleId, sizeId, prompt):
-    """
-    يبعت الصور كألبوم أول (سريع)،
-    وبعدين يبعتها كملفات (document) حتى تكون بجودة أصلية بدون ضغط تليكرام.
-    """
     total = len(urls)
 
     # 1) ألبوم سريع للمعاينة
@@ -125,9 +133,9 @@ def send_images_hd(uid, urls, styleId, sizeId, prompt):
     try:
         bot.send_media_group(uid, media)
     except Exception:
-        pass  # إذا فشل، الملفات بالأسفل تكفي
+        pass
 
-    # 2) نسخة ملفات بدون ضغط (الجودة الأصلية)
+    # 2) نسخة ملفات بدون ضغط
     bot.send_message(uid, "📥 هاي نسخة كاملة بدون ضغط (جودة أصلية):")
     for i, url in enumerate(urls, 1):
         try:
