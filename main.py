@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════
-#  📦 المكتبات (أولاً)
+#  📦 المكتبات
 # ═══════════════════════════════════════════════════════════
 
 import os
@@ -23,18 +23,30 @@ from telegram.error import TelegramError
 
 
 # ═══════════════════════════════════════════════════════════
-#  ⚙️ الإعدادات — عدّل هنا فقط
+#  ⚙️ الإعدادات
 # ═══════════════════════════════════════════════════════════
 
-# ⚠️ هذا التوكن مكشوف — ألغِه من @BotFather فوراً وضع الجديد
-BOT_TOKEN = "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA"
-ADMIN_ID  = 5952132218
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TOKEN")
+    or ""
+)
 
-DEV_USERNAME = "Mohammed "
+ADMIN_ID = int(
+    os.getenv("ADMIN_ID")
+    or "5952132218"
+)
+
+DEV_USERNAME = "Mohammed"
 DEV_LINK     = "https://t.me/c76xu"
 
+# ✅ المعرف الجديد
+CHANNEL_USERNAME = "@c2ccm"
+
 # ═══════════════════════════════════════════════════════════
-#  🔧 ثوابت داخلية — لا تعدّلها
+#  🔧 ثوابت
 # ═══════════════════════════════════════════════════════════
 
 STATE_FILE  = "state.json"
@@ -44,10 +56,10 @@ BROADCAST_DELAY = 0.05
 MAX_SESSIONS = 500
 KEEP_SESSIONS = 100
 
-DEFAULT_START = """• اهلا بك اخي في بوت تحميل من تيك توك 🐿️.
+DEFAULT_START = f"""• اهلا بك اخي في بوت تحميل من تيك توك 🐿️.
 • فقط ارسل الرابط وسيتم ارسال المقطع بدون علامةه مائيةه 🤍.
 . — — — — — — — — — — .
-• Tele : @OoOoO2oO | @c76xu ."""
+• Tele : {CHANNEL_USERNAME} | @c76xu ."""
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -746,3 +758,306 @@ async def _handle_add_admin(update, context, msg):
     else:
         STATE["admins"].append(new_id)
         persist()
+        await msg.reply_text("✅ تم رفع العضو ادمن")
+        try:
+            await context.bot.send_message(new_id, "🎉 تم رفعك أدمن في البوت")
+        except Exception:
+            pass
+    STATE["sessions"].pop(str(msg.chat_id), None)
+    persist()
+
+
+async def _handle_edit_start(update, context, msg):
+    txt = msg.text or msg.caption
+    if not txt:
+        await msg.reply_text("⚠️ أرسل نصاً")
+        return
+    STATE["start_message"] = txt
+    persist()
+    STATE["sessions"].pop(str(msg.chat_id), None)
+    persist()
+    await msg.reply_text("✅ تم التعيين بنجاح")
+
+
+async def _handle_set_sub_username(update, context, msg):
+    text = (msg.text or "").strip()
+    if not text.startswith("@") or len(text) < 2:
+        await msg.reply_text("⚠️ أرسل يوزر بصورة صحيحة مثل: @mychannel")
+        return
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(text, me.id)
+        if member.status not in ("administrator", "creator"):
+            await msg.reply_text("⚠️ البوت ليس أدمن في القناة. ارفعه أولاً.")
+            return
+    except TelegramError as e:
+        await msg.reply_text(f"⚠️ تعذر التحقق: {e}")
+        return
+    STATE["sub_channel"] = text
+    STATE["sub_link"] = f"https://t.me/{text.lstrip('@')}"
+    STATE["sub_enabled"] = True
+    persist()
+    STATE["sessions"].pop(str(msg.chat_id), None)
+    persist()
+    await msg.reply_text("✅ تم تفعيل الاشتراك الإجباري")
+
+
+async def _handle_set_sub_link(update, context, msg):
+    sess = STATE["sessions"].setdefault(str(msg.chat_id), {})
+    text = (msg.text or "").strip()
+
+    if msg.forward_from_chat:
+        sess["pending_channel_id"] = msg.forward_from_chat.id
+        sess["action"] = "set_sub_link"
+        persist()
+        await msg.reply_text(
+            f"✅ استلمت القناة: {msg.forward_from_chat.title}\n"
+            f"الآن أرسل رابط القناة (مثال: https://t.me/mychannel)",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    channel_id = sess.get("pending_channel_id")
+    if not channel_id:
+        await msg.reply_text(
+            "⚠️ أرسل توجيه من القناة أولاً (forward)",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if not (text.startswith("http") or "t.me" in text or "telegram.me" in text):
+        await msg.reply_text("⚠️ أرسل رابطاً صحيحاً")
+        return
+
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(channel_id, me.id)
+        if member.status not in ("administrator", "creator"):
+            await msg.reply_text("⚠️ البوت ليس أدمن في القناة. ارفعه أولاً.")
+            return
+    except TelegramError as e:
+        await msg.reply_text(f"⚠️ تعذر التحقق: {e}")
+        return
+
+    STATE["sub_channel"] = channel_id
+    STATE["sub_link"] = text
+    STATE["sub_enabled"] = True
+    persist()
+    sess.pop("action", None)
+    sess.pop("pending_channel_id", None)
+    persist()
+    await msg.reply_text(
+        "✅ تم تفعيل الاشتراك الإجباري بنجاح", reply_markup=back_kb()
+    )
+
+
+async def _handle_broadcast(update, context, msg):
+    sess = STATE["sessions"].get(str(msg.chat_id), {})
+    btype = sess.get("bc_type", "text")
+
+    if btype == "forward":
+        if not (msg.forward_from or msg.forward_from_chat):
+            await msg.reply_text("⚠️ أرسل رسالة موجّهة (forward) للإذاعة")
+            return
+        await _do_broadcast_forward(context, msg)
+    elif btype == "media":
+        if not any([msg.photo, msg.video, msg.audio, msg.voice,
+                    msg.document, msg.sticker, msg.contact]):
+            await msg.reply_text("⚠️ أرسل ميديا صحيحة")
+            return
+        await _do_broadcast_copy(context, msg)
+    elif btype == "photo":
+        if not msg.photo:
+            await msg.reply_text("⚠️ أرسل صورة")
+            return
+        await _do_broadcast_copy(context, msg)
+    elif btype == "inline":
+        if not (msg.forward_from or msg.forward_from_chat):
+            await msg.reply_text("⚠️ أرسل رسالة موجّهة (forward)")
+            return
+        await _do_broadcast_forward(context, msg)
+    else:
+        await _do_broadcast_copy(context, msg)
+
+    STATE["sessions"].pop(str(msg.chat_id), None)
+    persist()
+
+
+async def _do_broadcast_copy(context, msg):
+    sent = 0
+    failed = 0
+    for target in list(USERS):
+        if target == msg.chat_id:
+            continue
+        try:
+            await context.bot.copy_message(
+                chat_id=target,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+            )
+            sent += 1
+        except TelegramError:
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY)
+    await msg.reply_text(
+        f"✅ تم النشر إلى {sent} مشترك\n⚠️ فشل: {failed}",
+        reply_markup=back_kb(),
+    )
+
+
+async def _do_broadcast_forward(context, msg):
+    sent = 0
+    failed = 0
+    for target in list(USERS):
+        if target == msg.chat_id:
+            continue
+        try:
+            await context.bot.forward_message(
+                chat_id=target,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+            )
+            sent += 1
+        except TelegramError:
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY)
+    await msg.reply_text(
+        f"✅ تم توجيه إلى {sent} مشترك\n⚠️ فشل: {failed}",
+        reply_markup=back_kb(),
+    )
+
+
+async def _handle_upload_backup(update, context, msg):
+    if not msg.document:
+        await msg.reply_text("⚠️ أرسل ملف abbas.json")
+        return
+    if msg.document.file_name != "abbas.json":
+        await msg.reply_text(f"⚠️ اسم الملف غير صحيح: {msg.document.file_name}")
+        return
+    try:
+        f = await context.bot.get_file(msg.document.file_id)
+        await f.download_to_drive(str(USERS_FILE))
+        global USERS
+        USERS = load_users()
+        await msg.reply_text(
+            f"✅ تم رفع الملف\nعدد المشتركين الآن: {len(USERS)}",
+            reply_markup=back_kb(),
+        )
+    except Exception as e:
+        await msg.reply_text(f"⚠️ فشل: {e}")
+    STATE["sessions"].pop(str(msg.chat_id), None)
+    persist()
+
+
+# ═══════════════════════════════════════════════════════════
+#  🎵 تيك توك — تحميل واحد + بدون صوت + حذف فوري
+# ═══════════════════════════════════════════════════════════
+
+async def _handle_tiktok(update, context, url):
+    msg = update.message
+    uid = update.effective_user.id
+
+    wait_msg = await msg.reply_text("⏳ جاري جلب الفيديو...")
+
+    info = await fetch_tiktok(url)
+    if not info:
+        await wait_msg.edit_text("❌ فشل جلب الفيديو. جرب رابطاً آخر.")
+        return
+
+    stamp = f"{uid}_{msg.message_id}_{int(time.time())}"
+    tmp_video = f"dl_{stamp}.mp4"
+
+    try:
+        if await download_to_file(info["video_no_wm"], tmp_video, MAX_FILE_MB):
+            try:
+                with open(tmp_video, "rb") as f:
+                    await context.bot.send_video(
+                        chat_id=msg.chat_id,
+                        video=InputFile(f, filename="video.mp4"),
+                        caption=(
+                            f"العنوان: {info['title']}\n"
+                            f"المعرف: {info['author_id']}\n"
+                            f"الاسم: {info['author_name']}\n"
+                            f". — — — — — — — — — — .\n"
+                            f"• Tele: {CHANNEL_USERNAME} | @T3bsBoT ."
+                        ),
+                    )
+            except TelegramError as e:
+                logger.error(f"send video: {e}")
+                await msg.reply_text(f"⚠️ فشل إرسال الفيديو: {e}")
+        else:
+            await msg.reply_text(
+                "⚠️ تعذر تحميل الفيديو (حجم كبير أو رابط معطوب)"
+            )
+    finally:
+        try:
+            if os.path.exists(tmp_video):
+                os.remove(tmp_video)
+                logger.info(f"🗑️ تم حذف {tmp_video}")
+        except Exception as e:
+            logger.error(f"remove tmp: {e}")
+
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════
+#  ⚠️ معالج الأخطاء
+# ═══════════════════════════════════════════════════════════
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_user:
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ خطأ في البوت:\n"
+                f"User: {update.effective_user.id}\n"
+                f"Error: {context.error}",
+            )
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════
+#  🚀 MAIN
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 50)
+    print(f"🔍 BOT_TOKEN: {'✅ موجود' if BOT_TOKEN else '❌ مفقود'}")
+    print(f"🔍 ADMIN_ID: {ADMIN_ID}")
+    print(f"🔍 CHANNEL: {CHANNEL_USERNAME}")
+    print("=" * 50)
+
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        print("❌ التوكن غير صالح")
+        print("   تأكد من ضبطه في متغير البيئة BOT_TOKEN")
+        return
+    if not ADMIN_ID:
+        print("❌ ADMIN_ID غير صالح")
+        return
+
+    print("🚀 تشغيل البوت...")
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CallbackQueryHandler(on_callback))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+        app.add_error_handler(on_error)
+
+        logger.info("🚀 البوت يعمل...")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        print("=" * 50)
+        print(f"❌ خطأ فادح: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
