@@ -29,6 +29,9 @@ from telegram.error import TelegramError
 BOT_TOKEN = "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA" 
 ADMIN_ID  = 5952132218               # ← ايدي المطور (رقم فقط)
 
+DEV_USERNAME = "@c76me"
+DEV_LINK     = "https://t.me/c76xu"
+
 # ═══════════════════════════════════════════════════════════
 #  🔧 ثوابت داخلية — لا تعدّلها
 # ═══════════════════════════════════════════════════════════
