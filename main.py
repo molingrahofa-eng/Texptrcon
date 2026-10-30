@@ -34,16 +34,137 @@ BOT_TOKEN = (
     or ""
 )
 
-ADMIN_ID = int(
-    os.getenv("ADMIN_ID")
-    or "5952132218"
-)
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "5952132218")
 
 DEV_USERNAME = "Mohammed"
 DEV_LINK     = "https://t.me/c76xu"
 
-# ✅ المعرف الجديد
 CHANNEL_USERNAME = "@c2ccm"
+
+# اليوزر الذي يظهر تحت كل فيديو
+VIDEO_CREDIT = "@c76xu"
+
+FAKE_USERS_COUNT = 0   # ← ضع 10000 إذا أردت عرضاً وهمياً في الواجهة
+
+
+# ═══════════════════════════════════════════════════════════
+#  🌍 اللغات
+# ═══════════════════════════════════════════════════════════
+
+DEFAULT_LANG = "ar"
+
+LANGUAGES = {
+    "ar": {
+        "start": (
+            "• اهلا بك اخي في بوت تحميل من تيك توك 🐿️.\n"
+            "• فقط ارسل الرابط وسيتم ارسال المقطع بدون علامةه مائيةه 🤍.\n"
+            ". — — — — — — — — — — .\n"
+            "• Tele : {channel} | @c76xu ."
+        ),
+        "dev_btn": "• المطور .",
+        "fetching": "⏳ جاري جلب الفيديو...",
+        "fetch_failed": "❌ فشل جلب الفيديو. جرب رابطاً آخر.",
+        "download_failed": "⚠️ تعذر تحميل الفيديو (حجم كبير أو رابط معطوب)",
+        "send_failed": "⚠️ فشل إرسال الفيديو: {err}",
+        "video_title": "العنوان",
+        "video_author": "الاسم",
+        "video_id": "المعرف",
+        "admin_welcome": "🤍 | اهلا بك\n🤍 | اليك قائمه الاوامر",
+        "bot_locked": "عذرا البوت يخضع للتحديث الان",
+        "not_admin": "هذا الأمر للمشرفين فقط ⚠️",
+        "users_count": "👥 عدد الاعضاء: {n}",
+        "back_btn": "• الصفحه الرئيسيه",
+        "cancel_btn": "الغاء",
+    },
+    "en": {
+        "start": (
+            "• Welcome to the TikTok Downloader Bot 🐿️.\n"
+            "• Just send the link, and I'll send the video without watermark 🤍.\n"
+            ". — — — — — — — — — — .\n"
+            "• Tele : {channel} | @c76xu ."
+        ),
+        "dev_btn": "• Developer .",
+        "fetching": "⏳ Fetching video...",
+        "fetch_failed": "❌ Failed to fetch video. Try another link.",
+        "download_failed": "⚠️ Could not download video (too large or broken link)",
+        "send_failed": "⚠️ Failed to send video: {err}",
+        "video_title": "Title",
+        "video_author": "Author",
+        "video_id": "ID",
+        "admin_welcome": "🤍 | Welcome\n🤍 | Commands Menu",
+        "bot_locked": "Sorry, the bot is under maintenance.",
+        "not_admin": "This command is for admins only ⚠️",
+        "users_count": "👥 Users count: {n}",
+        "back_btn": "• Main Menu",
+        "cancel_btn": "Cancel",
+    },
+    "ru": {
+        "start": (
+            "• Добро пожаловать в бот загрузки из TikTok 🐿️.\n"
+            "• Просто отправьте ссылку, и я пришлю видео без водяного знака 🤍.\n"
+            ". — — — — — — — — — — .\n"
+            "• Tele : {channel} | @c76xu ."
+        ),
+        "dev_btn": "• Разработчик .",
+        "fetching": "⏳ Получаю видео...",
+        "fetch_failed": "❌ Не удалось получить видео. Попробуйте другую ссылку.",
+        "download_failed": "⚠️ Не удалось скачать видео (слишком большое или битая ссылка)",
+        "send_failed": "⚠️ Ошибка отправки видео: {err}",
+        "video_title": "Название",
+        "video_author": "Автор",
+        "video_id": "ID",
+        "admin_welcome": "🤍 | Добро пожаловать\n🤍 | Меню команд",
+        "bot_locked": "Извините, бот на обновлении.",
+        "not_admin": "Эта команда только для админов ⚠️",
+        "users_count": "👥 Пользователей: {n}",
+        "back_btn": "• Главное меню",
+        "cancel_btn": "Отмена",
+    },
+    "fr": {
+        "start": (
+            "• Bienvenue sur le bot TikTok 🐿️.\n"
+            "• Envoyez simplement le lien, je vous enverrai la vidéo sans filigrane 🤍.\n"
+            ". — — — — — — — — — — .\n"
+            "• Tele : {channel} | @c76xu ."
+        ),
+        "dev_btn": "• Développeur .",
+        "fetching": "⏳ Récupération de la vidéo...",
+        "fetch_failed": "❌ Échec de récupération. Essayez un autre lien.",
+        "download_failed": "⚠️ Impossible de télécharger (trop volumineux ou lien cassé)",
+        "send_failed": "⚠️ Échec d'envoi: {err}",
+        "video_title": "Titre",
+        "video_author": "Auteur",
+        "video_id": "ID",
+        "admin_welcome": "🤍 | Bienvenue\n🤍 | Menu des commandes",
+        "bot_locked": "Le bot est en maintenance.",
+        "not_admin": "Commande réservée aux admins ⚠️",
+        "users_count": "👥 Utilisateurs : {n}",
+        "back_btn": "• Menu principal",
+        "cancel_btn": "Annuler",
+    },
+}
+
+
+def get_lang(update) -> str:
+    if not update or not update.effective_user:
+        return DEFAULT_LANG
+    code = (update.effective_user.language_code or "").lower()
+    if code in LANGUAGES:
+        return code
+    base = code.split("-")[0]
+    if base in LANGUAGES:
+        return base
+    return DEFAULT_LANG
+
+
+def tr(key: str, lang: str, **kwargs) -> str:
+    texts = LANGUAGES.get(lang) or LANGUAGES[DEFAULT_LANG]
+    txt = texts.get(key) or LANGUAGES[DEFAULT_LANG].get(key) or key
+    try:
+        return txt.format(**kwargs) if kwargs else txt
+    except (KeyError, IndexError):
+        return txt
+
 
 # ═══════════════════════════════════════════════════════════
 #  🔧 ثوابت
@@ -55,11 +176,6 @@ MAX_FILE_MB = 48
 BROADCAST_DELAY = 0.05
 MAX_SESSIONS = 500
 KEEP_SESSIONS = 100
-
-DEFAULT_START = f"""• اهلا بك اخي في بوت تحميل من تيك توك 🐿️.
-• فقط ارسل الرابط وسيتم ارسال المقطع بدون علامةه مائيةه 🤍.
-. — — — — — — — — — — .
-• Tele : {CHANNEL_USERNAME} | @c76xu ."""
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -322,7 +438,7 @@ def cleanup_sessions() -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎛️ أزرار مساعدة
+#  🎛️ أزرار
 # ═══════════════════════════════════════════════════════════
 
 def btn(text, data=None, url=None):
@@ -366,7 +482,7 @@ ADMIN_HEADER = (
 
 
 # ═══════════════════════════════════════════════════════════
-#  🔒 فحص الاشتراك الإجباري
+#  🔒 فحص الاشتراك
 # ═══════════════════════════════════════════════════════════
 
 async def subscription_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -409,6 +525,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
     uname = update.effective_user.username or "بلا معرف"
+    lang = get_lang(update)
 
     is_new = add_user(uid)
     if is_new and not is_admin(uid):
@@ -419,6 +536,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• الاسم : {update.effective_user.first_name}\n"
                 f"• المعرف : @{uname}\n"
                 f"• الايدي : {uid}\n"
+                f"• اللغة : {lang}\n"
                 f"• عدد الاعضاء : {len(USERS)}",
             )
         except Exception:
@@ -431,7 +549,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if STATE["bot_locked"] and not is_admin(uid):
-        await msg.reply_text("عذرا البوت يخضع للتحديث الان")
+        await msg.reply_text(tr("bot_locked", lang))
         return
 
     if is_admin(uid):
@@ -442,8 +560,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    start_text = STATE.get("start_message") or DEFAULT_START
-    kb = InlineKeyboardMarkup([[btn("• المطور .", url=DEV_LINK)]])
+    if STATE.get("start_message"):
+        start_text = STATE["start_message"]
+    else:
+        start_text = tr("start", lang, channel=CHANNEL_USERNAME)
+
+    kb = InlineKeyboardMarkup([[btn(tr("dev_btn", lang), url=DEV_LINK)]])
     await msg.reply_text(
         start_text, reply_markup=kb, disable_web_page_preview=True,
     )
@@ -457,9 +579,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     data = q.data or ""
+    lang = get_lang(update)
 
     if not is_admin(uid):
-        await q.answer("هذا الأمر للمشرفين فقط ⚠️", show_alert=True)
+        await q.answer(tr("not_admin", lang), show_alert=True)
         return
     await q.answer()
 
@@ -490,8 +613,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "userd":
+        shown = len(USERS) + FAKE_USERS_COUNT
         await q.edit_message_text(
-            f"👥 عدد الاعضاء: {len(USERS)}", reply_markup=back_kb()
+            tr("users_count", lang, n=f"{shown:,}"),
+            reply_markup=back_kb(),
         )
         return
 
@@ -607,6 +732,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = STATE["stats"]
         total = st["admin_messages"] + st["user_messages"]
         today_n = len(st["today_users"])
+        shown_users = len(USERS) + FAKE_USERS_COUNT
         last5 = USERS[-5:][::-1]
         last5_txt = "\n".join(
             f"▫️ {i+1}- {u}" for i, u in enumerate(last5)
@@ -614,7 +740,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (
             f"*اهلا بك في قسم الاحصائيات 📊\n"
             f"--------------------------\n"
-            f"عدد اعضاء بوتك : {len(USERS)}\n"
+            f"عدد اعضاء بوتك : {shown_users:,}\n"
             f"المتفاعلين اليوم : {today_n}\n"
             f"رسائل الأدمن : {st['admin_messages']}\n"
             f"رسائل المستخدمين : {st['user_messages']}\n"
@@ -697,13 +823,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     chat_id = msg.chat_id
+    lang = get_lang(update)
 
     bump_stats(is_admin(uid))
     track_today_user(uid)
     cleanup_sessions()
 
     if STATE["bot_locked"] and not is_admin(uid):
-        await msg.reply_text("عذرا البوت يخضع للتحديث الان")
+        await msg.reply_text(tr("bot_locked", lang))
         return
 
     if not await subscription_ok(update, context):
@@ -950,18 +1077,19 @@ async def _handle_upload_backup(update, context, msg):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎵 تيك توك — تحميل واحد + بدون صوت + حذف فوري
+#  🎵 تيك توك — وصف الفيديو @c76xu
 # ═══════════════════════════════════════════════════════════
 
 async def _handle_tiktok(update, context, url):
     msg = update.message
     uid = update.effective_user.id
+    lang = get_lang(update)
 
-    wait_msg = await msg.reply_text("⏳ جاري جلب الفيديو...")
+    wait_msg = await msg.reply_text(tr("fetching", lang))
 
     info = await fetch_tiktok(url)
     if not info:
-        await wait_msg.edit_text("❌ فشل جلب الفيديو. جرب رابطاً آخر.")
+        await wait_msg.edit_text(tr("fetch_failed", lang))
         return
 
     stamp = f"{uid}_{msg.message_id}_{int(time.time())}"
@@ -975,20 +1103,18 @@ async def _handle_tiktok(update, context, url):
                         chat_id=msg.chat_id,
                         video=InputFile(f, filename="video.mp4"),
                         caption=(
-                            f"العنوان: {info['title']}\n"
-                            f"المعرف: {info['author_id']}\n"
-                            f"الاسم: {info['author_name']}\n"
+                            f"{tr('video_title', lang)}: {info['title']}\n"
+                            f"{tr('video_id', lang)}: {info['author_id']}\n"
+                            f"{tr('video_author', lang)}: {info['author_name']}\n"
                             f". — — — — — — — — — — .\n"
-                            f"• Tele: {CHANNEL_USERNAME} | @T3bsBoT ."
+                            f"• Tele: {VIDEO_CREDIT}"
                         ),
                     )
             except TelegramError as e:
                 logger.error(f"send video: {e}")
-                await msg.reply_text(f"⚠️ فشل إرسال الفيديو: {e}")
+                await msg.reply_text(tr("send_failed", lang, err=str(e)))
         else:
-            await msg.reply_text(
-                "⚠️ تعذر تحميل الفيديو (حجم كبير أو رابط معطوب)"
-            )
+            await msg.reply_text(tr("download_failed", lang))
     finally:
         try:
             if os.path.exists(tmp_video):
@@ -1030,11 +1156,13 @@ def main():
     print(f"🔍 BOT_TOKEN: {'✅ موجود' if BOT_TOKEN else '❌ مفقود'}")
     print(f"🔍 ADMIN_ID: {ADMIN_ID}")
     print(f"🔍 CHANNEL: {CHANNEL_USERNAME}")
+    print(f"🔍 VIDEO_CREDIT: {VIDEO_CREDIT}")
+    print(f"🔍 Languages: {', '.join(LANGUAGES.keys())}")
+    print(f"🔍 Fake users: {FAKE_USERS_COUNT:,}")
     print("=" * 50)
 
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         print("❌ التوكن غير صالح")
-        print("   تأكد من ضبطه في متغير البيئة BOT_TOKEN")
         return
     if not ADMIN_ID:
         print("❌ ADMIN_ID غير صالح")
